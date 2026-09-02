@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # <bitbar.title>Claude Code Usage</bitbar.title>
-# <bitbar.version>1.2.0</bitbar.version>
+# <bitbar.version>1.3.0</bitbar.version>
 # <bitbar.author>y1guo</bitbar.author>
 # <bitbar.author.github>y1guo</bitbar.author.github>
 # <bitbar.desc>Claude Code session and weekly/monthly rate-limit utilization in the menu bar.</bitbar.desc>
@@ -27,6 +27,22 @@ UA_FALLBACK="2.1.258"
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-usage-swiftbar"
 CACHE="$STATE_DIR/usage.json"
 STATE="$STATE_DIR/state"
+# Tab-separated on purpose, unlike everything above: awk's FS="\t" does not
+# collapse runs the way bash's IFS does, none of its four fields can be empty,
+# and a tab keeps the file plottable with anything.
+HISTORY="$STATE_DIR/history.tsv"
+
+# One row per window per successful fetch. 24 bins is what fits beside the
+# 24-column indent the sub-rows use; 30 days at a 180s poll is ~1.7 MB.
+#
+# HIST_MIN_BIN must track the poll interval in this file's name: a bin narrower
+# than one poll is empty by construction. HIST_MIN_SPAN is how much of a cycle
+# has to be on record before anything is drawn at all.
+HIST_BINS=24
+HIST_MIN_BIN=180
+HIST_MIN_SPAN=3600
+HIST_KEEP=$(( 30 * 86400 ))
+HIST_PRUNE_EVERY=86400
 
 # Field separator between jq and the read loops. Deliberately NOT a tab: tab is
 # an IFS whitespace character, so bash collapses runs of them and an empty field
@@ -66,13 +82,14 @@ NOW=$(date +%s)
 # ---- helpers ----------------------------------------------------------------
 
 fetched_at=0; backoff_until=0; rl_fails=0; net_fails=0; last_error=""
+pruned_at=0; did_fetch=0
 
 # Parsed, never sourced: a truncated or tampered state file must not become
 # shell code, and must not wedge the plugin under `set -u`.
 if [[ -f "$STATE" ]]; then
   while IFS='=' read -r k v; do
     case "$k" in
-      fetched_at|backoff_until|rl_fails|net_fails)
+      fetched_at|backoff_until|rl_fails|net_fails|pruned_at)
         [[ "$v" =~ ^[0-9]+$ ]] && printf -v "$k" '%s' "$v" ;;
       last_error)
         last_error="$v" ;;
@@ -84,9 +101,16 @@ fi
 # is the longest backoff this script ever sets, so anything beyond it is bogus.
 (( backoff_until > NOW + 1800 )) && backoff_until=0
 
+# Same class of bogus persisted deadline, and this one never self-heals: the
+# script only ever stamps pruned_at with its own NOW, so a value in the future
+# came from a wrong clock and would otherwise hold off pruning until real time
+# caught up — leaving the history file to grow without bound in the meantime.
+(( pruned_at > NOW )) && pruned_at=0
+
 save_state() {
-  printf 'fetched_at=%s\nbackoff_until=%s\nrl_fails=%s\nnet_fails=%s\nlast_error=%s\n' \
-    "$fetched_at" "$backoff_until" "$rl_fails" "$net_fails" "${last_error//[$'\n'|]/ }" \
+  printf 'fetched_at=%s\nbackoff_until=%s\nrl_fails=%s\nnet_fails=%s\npruned_at=%s\nlast_error=%s\n' \
+    "$fetched_at" "$backoff_until" "$rl_fails" "$net_fails" "$pruned_at" \
+    "${last_error//[$'\n'|]/ }" \
     > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
 }
 
@@ -194,6 +218,204 @@ for dep in curl jq security; do
   command -v "$dep" >/dev/null 2>&1 || die "⚠️ deps" <<< "$dep not found on PATH | $DIM"
 done
 
+# ---- history ----------------------------------------------------------------
+
+# History is keyed by window, and a window is only the same window if the model
+# scope matches too: "Weekly" and "Weekly (Fable)" are different series.
+win_id() {
+  local id="${1:-limit}"
+  [[ -n "${2:-}" && "$2" != "null" ]] && id="$1:$2"
+  printf '%s' "${id//[^A-Za-z0-9_:.-]/_}"
+}
+
+# Which reset a sample belongs to, rounded to the nearest 5 minutes. The API
+# jitters resets_at by a fraction of a second between fetches (21:00:00.234 one
+# minute, 20:59:59.622 the next), and keying history on the raw epoch would
+# start a fresh "cycle" on almost every sample. Real cycles are hours apart, so
+# a 5-minute bucket cannot merge two of them.
+cycle_key() {
+  local e
+  e=$(iso_to_epoch "${1:-}") || return 1
+  printf '%s' $(( (e + 150) / 300 * 300 ))
+}
+
+# One pass over the history file for every window at once, because the render
+# path runs on every SwiftBar tick and the file is tens of thousands of lines.
+#
+# Samples are binned by wall-clock time, not by index: SwiftBar does not run
+# while the Mac sleeps and the fetch backs off after a 429, so the gaps between
+# samples are uneven and drawing them evenly spaced would misstate every slope.
+# A bin with no sample is drawn as a gap rather than carried forward — quota can
+# move while we are not looking, so a flat line there would be an invention.
+#
+# Rates are differenced across a span of bins rather than between adjacent
+# samples: the API reports whole percents, so consecutive samples differ by 0 or
+# 1 and a per-sample derivative is quantisation noise, not a burn rate. That
+# span is half an hour where bins are narrower than that, one bin where they are
+# wider, and never more than a quarter of the chart.
+history_series() {  # spec: "id|cycle_epoch;..." -> one SEP-separated row per id
+  [[ -s "$HISTORY" ]] || return 0
+  awk -v now="$NOW" -v nb="$HIST_BINS" -v minbin="$HIST_MIN_BIN" -v minspan="$HIST_MIN_SPAN" \
+      -v spec="$1" -v sep="$SEP" '
+    BEGIN {
+      FS = "\t"
+      L[0]="▁"; L[1]="▂"; L[2]="▃"; L[3]="▄"; L[4]="▅"; L[5]="▆"; L[6]="▇"; L[7]="█"
+      GAP = "·"
+      ni = split(spec, it, ";")
+      for (i = 1; i <= ni; i++) {
+        if (split(it[i], kv, "|") != 2) continue
+        want[kv[1]] = 1; cyc[kv[1]] = kv[2] + 0; ord[++no] = kv[1]
+      }
+    }
+    # Only the current cycle: these windows reset, so splicing cycles together
+    # would draw a sawtooth and a derivative full of cliffs.
+    $1 ~ /^[0-9]+$/ && ($2 in want) && ($4 + 0) == cyc[$2] {
+      k = ++cnt[$2]; T[$2, k] = $1 + 0; P[$2, k] = $3 + 0
+    }
+    END {
+      # One format for every row, sentinel included, so the column count cannot
+      # drift between the two places that emit one.
+      fmt = "%s%s%d%s%s%s%s%s%s%s%d%s%d%s%s%s%s\n"
+      for (i = 1; i <= no; i++) {
+        id = ord[i]; m = cnt[id] + 0
+        # start is a min-scan rather than T[id,1]: the file is append-ordered
+        # only while the clock moves forward.
+        start = 0
+        if (m >= 2) {
+          start = T[id, 1]
+          for (k = 2; k <= m; k++) if (T[id, k] < start) start = T[id, k]
+        }
+        # Nothing is drawn for the first hour of a cycle. A chart over three
+        # minutes of samples is not a chart, and a rate extrapolated from the
+        # single whole percent that landed in them is not a rate.
+        if (m < 2 || now - start < minspan) {
+          printf fmt, id, sep, 0, sep, "-", sep, "-", sep, "-", sep, 0, sep, 0, sep, "-", sep, "-"
+          continue
+        }
+        span = now - start
+        # Bins never narrower than the poll interval: finer than that and most
+        # of them are empty by construction, which would read as lost samples.
+        nbx = int(span / minbin); if (nbx > nb) nbx = nb
+        w = span / nbx
+        for (b = 0; b < nbx; b++) { has[b] = 0; v[b] = 0; tv[b] = 0 }
+        lo = P[id, 1]; hi = P[id, 1]
+        for (k = 1; k <= m; k++) {
+          p = P[id, k]
+          if (p < lo) lo = p
+          if (p > hi) hi = p
+          b = int((T[id, k] - start) / w)
+          if (b >= nbx) b = nbx - 1
+          if (!has[b] || p > v[b]) { v[b] = p; tv[b] = T[id, k]; has[b] = 1 }
+        }
+        # Drawn across lo..hi widened to at least 4 points, not 0..100: a weekly
+        # window first seen at 60% and now at 68% would otherwise be 24
+        # identical full blocks, and the widening keeps a 1% wobble from being
+        # drawn as a climb. The label states the observed range, so a series
+        # narrower than 4 points does not reach the top of the chart.
+        top = hi; if (top - lo < 4) top = lo + 4
+        acc = ""
+        for (b = 0; b < nbx; b++) {
+          if (!has[b]) { acc = acc GAP; continue }
+          acc = acc L[int((v[b] - lo) / (top - lo) * 7.999)]
+        }
+        # 30 minutes of lag where the cycle is long enough to afford it, but
+        # never more than a quarter of the chart: a longer lag than that leaves
+        # the left of the rate row with nothing to say for hours.
+        lag = int(1800 / w); if (lag > int(nbx / 4)) lag = int(nbx / 4)
+        if (lag < 1) lag = 1
+        # Both ends of a difference have to be real samples, and the divisor is
+        # the time that actually elapsed between them. Carrying the last known
+        # value across a sleep and dividing by the nominal lag would charge
+        # every percent the gap hid to the one bin after it — a spike that never
+        # happened, which then sets the scale for the whole row.
+        for (b = 0; b < nbx; b++) {
+          d[b] = -1
+          if (b < lag || !has[b] || !has[b - lag]) continue
+          el = tv[b] - tv[b - lag]
+          if (el <= 0) continue
+          d[b] = (v[b] - v[b - lag]) * 3600 / el
+          if (d[b] < 0) d[b] = 0
+        }
+        # A three-bin mean on top of that difference. Without it the bar
+        # alternates between "one whole percent landed in this window" and "two
+        # did", which looks like a burst pattern that is not there.
+        mx = 0
+        for (b = 0; b < nbx; b++) {
+          r[b] = -1
+          if (d[b] < 0) continue
+          sum = 0; cn = 0
+          for (j = b - 1; j <= b + 1; j++)
+            if (j >= 0 && j < nbx && d[j] >= 0) { sum += d[j]; cn++ }
+          r[b] = sum / cn
+          if (r[b] > mx) mx = r[b]
+        }
+        rs = ""
+        for (b = 0; b < nbx; b++) {
+          if (r[b] < 0) { rs = rs GAP; continue }
+          rs = rs L[(mx > 0) ? int(r[b] / mx * 7.999) : 0]
+        }
+        # Headline rate over the trailing hour, so "idle" shows up as idle
+        # rather than as the average since the window opened.
+        #
+        # The anchor has to be an hour old, not merely the newest sample that
+        # is at least an hour old: after a sleep that is the last sample before
+        # the sleep, and averaging over the gap dilutes a fresh burn towards
+        # zero — the one direction a quota indicator must never err in. When
+        # there is no usable anchor an hour back, anchor at the oldest sample
+        # inside the hour instead, and say nothing at all until that gives a
+        # basis worth quoting.
+        ref = 0
+        for (k = 1; k <= m; k++) if (T[id, k] <= now - 3600) ref = k
+        if (ref == 0 || now - T[id, ref] > 5400) {
+          ref = m
+          for (k = m; k >= 1; k--) if (T[id, k] >= now - 3600) ref = k
+        }
+        dt = T[id, m] - T[id, ref]
+        cur = -1; eta = -1
+        if (dt >= 900) {
+          cur = (P[id, m] - P[id, ref]) * 3600 / dt
+          if (cur < 0) cur = 0
+          if (cur > 0 && P[id, m] < 100) eta = (100 - P[id, m]) / cur * 3600
+        }
+        printf fmt, id, sep, span, sep, acc, sep, rs, sep,
+          (cur < 0 ? "-" : sprintf("%.1f", cur)), sep, lo, sep, hi, sep,
+          (eta < 0 ? "-" : sprintf("%d", eta)), sep, sprintf("%.1f", mx)
+      }
+    }' "$HISTORY" 2>/dev/null
+}
+
+# Two rows under a window: what the cycle has looked like, and how fast it is
+# moving. Both are labelled with the range they are drawn across, because both
+# sparklines are scaled to their own series rather than to a fixed 0-100.
+hist_rows() {  # $1 window id, $2 reset epoch (0 if unknown)
+  local id="$1" reset_at="${2:-0}" hid span acc rate cur lo hi eta peak note
+  [[ -n "$hist_out" ]] || return 0
+  while IFS="$SEP" read -r hid span acc rate cur lo hi eta peak; do
+    [[ "$hid" == "$id" ]] || continue
+    if [[ "$span" == "0" ]]; then
+      printf '%sgathering history… | %s\n' "$PAD" "$DIM"
+      return 0
+    fi
+    printf '%s%s  %s→%s%%  over %s | %s\n' "$PAD" "$acc" "$lo" "$hi" \
+      "$(human_delta "$span")" "$ROW"
+    if [[ "$cur" == "-" ]]; then
+      note="rate unknown"
+    elif [[ "$cur" == "0.0" ]]; then
+      note="idle"
+    elif [[ "$eta" == "-" ]]; then
+      note="now $cur"
+    elif (( reset_at > 0 && NOW + eta > reset_at )); then
+      # The honest headline once the window will reset before the quota runs
+      # out: the countdown above is what matters, not a projection past it.
+      note="now $cur · resets first"
+    else
+      note="now $cur · 100% in $(human_delta "$eta")"
+    fi
+    printf '%s%s  0→%s %%/h  %s | %s\n' "$PAD" "$rate" "$peak" "$note" "$ROW"
+    return 0
+  done <<< "$hist_out"
+}
+
 # ---- fetch ------------------------------------------------------------------
 
 if (( NOW >= backoff_until )); then
@@ -236,6 +458,7 @@ if (( NOW >= backoff_until )); then
           # otherwise parse as zeros and read as "plenty of quota left".
           printf '%s' "$body" > "$CACHE.tmp" && mv -f "$CACHE.tmp" "$CACHE"
           fetched_at=$NOW; rl_fails=0; net_fails=0; backoff_until=0; last_error=""
+          did_fetch=1
         else
           last_error="malformed response"
           backoff_until=$(( NOW + 60 ))
@@ -309,6 +532,46 @@ if [[ -z "$rows" ]]; then
 	EOF
 fi
 
+# One pass over the windows for both the write and the read: history is only
+# useful if the key it is written under is the key it is looked up by, and two
+# passes computing that key independently are how they drift apart.
+#
+# A window with no resets_at is skipped rather than filed under cycle 0. There
+# is no cycle to chart it against, so a row for it would be dead weight in the
+# file forever. Tabs are spelled out because they are the history file's field
+# separator and an invisible one in a string literal is a trap.
+samples=""; hist_spec=""
+while IFS="$SEP" read -r kind group pct reset model; do
+  [[ -z "$kind" ]] && continue
+  [[ "$pct" =~ ^[0-9]+$ ]] || continue
+  cycle=$(cycle_key "$reset") || continue
+  id=$(win_id "$kind" "$model")
+  samples+="$NOW"$'\t'"$id"$'\t'"$pct"$'\t'"$cycle"$'\n'
+  hist_spec+="${hist_spec:+;}$id|$cycle"
+done <<< "$rows"
+
+# Only on a fetch. SwiftBar re-renders on wake, on click and on every backed-off
+# tick; stamping the cached numbers again with a fresh timestamp would flatten
+# every rate that follows. The 0700 state directory is what keeps this private,
+# same as the cache and the state file.
+if (( did_fetch )) && [[ -n "$samples" ]]; then
+  printf '%s' "$samples" >> "$HISTORY" 2>/dev/null
+
+  # Same atomic dance as the cache: a half-written prune must never become the
+  # history file. The temp name carries the pid because this one is a
+  # read-modify-write — two overlapping runs sharing a temp path could
+  # interleave their output, where the cache's whole-file writes cannot.
+  if (( NOW - pruned_at > HIST_PRUNE_EVERY )); then
+    awk -F'\t' -v c=$(( NOW - HIST_KEEP )) '$1 ~ /^[0-9]+$/ && $1 + 0 >= c' \
+      "$HISTORY" > "$HISTORY.$$" 2>/dev/null && mv -f "$HISTORY.$$" "$HISTORY"
+    pruned_at=$NOW
+    save_state
+  fi
+fi
+
+hist_out=""
+[[ -n "$hist_spec" ]] && hist_out=$(history_series "$hist_spec")
+
 # Menu bar shows the short window and whichever long window is closest to
 # biting — that is the number that will actually stop you, whether the plan
 # calls it weekly, monthly, or something this script has not seen.
@@ -345,6 +608,7 @@ while IFS="$SEP" read -r kind group pct reset model; do
   (( first )) || printf -- '---\n'
   first=0
   window_row "$(label_for "$kind" "$model")" "$pct" "$reset"
+  hist_rows "$(win_id "$kind" "$model")" "$(iso_to_epoch "$reset" || printf 0)"
 done <<< "$rows"
 
 extra=$(jq -r '
@@ -369,3 +633,8 @@ else
 fi
 printf 'Refresh now | refresh=true\n'
 printf 'Reveal cached response | bash=/usr/bin/open param1=-R param2="%s" terminal=false\n' "$CACHE"
+# An `if` rather than a `&&` chain: this is the last command in the script, and
+# a false test would otherwise make the plugin exit non-zero on a first run.
+if [[ -s "$HISTORY" ]]; then
+  printf 'Reveal usage history | bash=/usr/bin/open param1=-R param2="%s" terminal=false\n' "$HISTORY"
+fi

@@ -82,9 +82,68 @@ Windows come from the response's `limits[]` array; the older `five_hour` /
 `seven_day` fields are used as a fallback if that array ever disappears.
 
 State lives in `${XDG_CACHE_HOME:-~/.cache}/claude-usage-swiftbar/` — the last
-good response and the backoff bookkeeping — in a `0700` directory. The state
-file is parsed, never sourced, so a corrupt or tampered one cannot become shell
-code or wedge the plugin.
+good response, the backoff bookkeeping and the usage history — in a `0700`
+directory. The state file is parsed, never sourced, so a corrupt or tampered one
+cannot become shell code or wedge the plugin.
+
+## History
+
+The plugin polls on the interval in its filename whether or not you ever open
+the menu — that is what keeps the menu bar number current — so it can keep a
+record for free. Every successful fetch appends one row per window to
+`history.tsv` in the state directory, and the dropdown draws the current cycle
+underneath each meter:
+
+```
+Weekly (all)        68% ███████░░░
+                        resets in 3d 0h  (Sat 15:00)
+                        ▁▁▁▁▁▂▂▂▃▃▃▄▄▄▅▅▅▆▆▆▇▇▇█  60→68%  over 6h 0m
+                        ··▅▆██▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▅  0→1.8 %/h  now 1.0 · 100% in 1d 8h
+```
+
+The top sparkline is utilization, the bottom one is how fast it is climbing, and
+each is labelled with the range it is drawn across — neither is scaled to a
+fixed 0–100%, or a window sitting at 8% would be a flat line on the floor. The
+tail is the burn rate over the last hour and what it implies: `100% in 1d 8h`,
+or `resets first` when the window turns over before the quota runs out, or
+`idle` for a window that has not moved in an hour, or `rate unknown` when the
+last hour holds too few samples to say — which is what it says after a long
+sleep, rather than averaging a fresh burn away across the gap.
+
+Charts appear once an hour of the *current cycle* is on record, and read
+`gathering history…` until then. That includes the first hour after every reset,
+not just the first hour after install.
+
+Four things the drawing is careful about, because the underlying data does not
+support naivety:
+
+- **Cycles are charted separately.** These windows reset, so one continuous line
+  across a reset would be a sawtooth and its derivative would be all cliffs.
+  Each chart covers the current cycle only, and `over 6h 0m` says how much of
+  that cycle has actually been observed — a window that reset before you
+  installed the plugin charts from first sample, not from the reset.
+- **Gaps are drawn as gaps.** SwiftBar does not run while the Mac sleeps and the
+  fetch backs off after a 429, so samples are unevenly spaced. Bins are by
+  wall-clock time and never narrower than one poll, and a bin with no sample is
+  `·` rather than a carried-forward flat line — quota can move while we are not
+  looking. The rate row needs a real sample at *both* ends of its difference, so
+  it stays blank across a gap and for a while after one instead of charging
+  everything the gap hid to the first bin back.
+- **Rates are differenced across a span of bins, then smoothed** — half an hour
+  where bins are narrower than that, one bin where they are wider. The API
+  reports whole percents, so consecutive 180s samples differ by 0 or 1 and a
+  per-sample derivative is quantisation noise rather than a burn rate.
+- **Both sparklines are scaled to their own series.** `60→68%` and `0→1.8 %/h`
+  state the observed range, so a tall bar means "high for this cycle", not "near
+  the limit" — the number beside the meter is the absolute one. A range narrower
+  than 4 points is drawn over a 4-point span, so a 1% wobble is not stretched
+  into a climb and does not reach the top of the chart.
+
+`history.tsv` is tab-separated `epoch`, `window`, `percent`, `cycle` — plottable
+with anything — pruned to 30 days (about 1.7 MB) and openable from **Reveal
+usage history** in the dropdown. It holds a timestamp, the window name including
+the model scope where the API reports one, the utilization percentage and which
+reset it belongs to. No prompts, no content, no credentials.
 
 ## Failures
 
@@ -114,7 +173,9 @@ your Claude Code login.
 - Only utilization percentages are available. `limit_dollars` and `used_dollars`
   come back `null` on subscription plans, so there is no absolute "X of Y".
 - The poll interval is encoded in the filename (`.180s.`). 180s is what the
-  endpoint tolerates; faster invites 429s.
+  endpoint tolerates; faster invites 429s. It is also the best resolution the
+  history can have, and the real resolution is coarser: sleep and backoff both
+  cost samples.
 
 ## License
 
