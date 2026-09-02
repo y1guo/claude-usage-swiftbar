@@ -33,10 +33,32 @@ STATE="$STATE_DIR/state"
 # (a limits[] entry with no "group") would silently shift every later column.
 SEP=$'\x1f'
 
+# The menu bar title carries no colour below 80%, so macOS inverts it when the
+# menu opens; the warn and crit shades below deliberately override that.
 FONT="font=Menlo size=12"
-DIM="font=Menlo size=11 color=#8a8a8e"
-WARN_COLOR="color=#ff9f0a"   # >= 80%
-CRIT_COLOR="color=#ff453a"   # >= 90%
+
+# Dropdown rows carry an explicit colour, and not only for contrast: SwiftBar
+# gives a line a click target only when it has an action *or* a colour
+# (configureAction in MenuBarItem.swift), and AppKit greys out a menu item whose
+# target is nil. A plain uncoloured text row therefore renders as a disabled
+# item — washed out next to SwiftBar's own entries. Pairs are light,dark.
+#
+# trim=false is what makes the indentation below real: SwiftBar strips leading
+# whitespace from a title unless asked not to (MenuBarItem.swift), so every
+# padded row would otherwise collapse against the left margin and the columns
+# would line up only in the source. Both sizes are 12 for the same reason — one
+# monospace grid, or the padding means a different width on each row.
+ROW="font=Menlo size=12 color=#1d1d1f,#f5f5f7 trim=false"
+DIM="font=Menlo size=12 color=#5f5f66,#a8a8b0 trim=false"
+
+# Amber and red at the menu bar, darkened for the light menu bar where the
+# system shades are too pale to read.
+WARN_COLOR="color=#b35a00,#ff9f0a"   # >= 80%
+CRIT_COLOR="color=#bf2d24,#ff453a"   # >= 90%
+
+# Everything under a window label starts in the same column as its meter:
+# 18 for the label field, then the width of the " %3d%% " that precedes a bar.
+PAD="                        "
 
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 NOW=$(date +%s)
@@ -109,7 +131,7 @@ meter() {
   (( filled > 10 )) && filled=10
   (( filled < 0 ))  && filled=0
   for (( i = 0; i < 10; i++ )); do
-    (( i < filled )) && out+="▓" || out+="░"
+    (( i < filled )) && out+="█" || out+="░"
   done
   printf '%s' "$out"
 }
@@ -141,9 +163,9 @@ label_for() {
 meter_row() {
   local label="${1//[|$'\n']/ }" pct="${2:-}"
   if [[ "$pct" =~ ^[0-9]+$ ]]; then
-    printf '%-18s %3d%% %s | %s\n' "$label" "$pct" "$(meter "$pct")" "$FONT"
+    printf '%-18s %3d%% %s | %s\n' "$label" "$pct" "$(meter "$pct")" "$ROW"
   else
-    printf '%-18s   ?%% unreadable | %s\n' "$label" "$FONT"
+    printf '%-18s   ?%% unreadable | %s\n' "$label" "$ROW"
   fi
 }
 
@@ -152,10 +174,10 @@ window_row() {
   meter_row "$1" "$2"
   if epoch=$(iso_to_epoch "${3:-}"); then
     delta=$(( epoch - NOW ))
-    printf '%-18s resets in %s  (%s) | %s\n' "" "$(human_delta "$delta")" \
+    printf '%sresets in %s  (%s) | %s\n' "$PAD" "$(human_delta "$delta")" \
       "$(date -r "$epoch" '+%a %H:%M')" "$DIM"
   else
-    printf '%-18s no active window | %s\n' "" "$DIM"
+    printf '%sno active window | %s\n' "$PAD" "$DIM"
   fi
 }
 
