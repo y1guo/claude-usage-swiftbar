@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # <bitbar.title>Claude Code Usage</bitbar.title>
-# <bitbar.version>1.4.0</bitbar.version>
+# <bitbar.version>1.5.0</bitbar.version>
 # <bitbar.author>y1guo</bitbar.author>
 # <bitbar.author.github>y1guo</bitbar.author.github>
 # <bitbar.desc>Claude Code session and weekly/monthly rate-limit utilization in the menu bar.</bitbar.desc>
@@ -9,6 +9,7 @@
 # <bitbar.abouturl>https://github.com/y1guo/claude-usage-swiftbar</bitbar.abouturl>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
+# <swiftbar.var>select(CLAUDE_USAGE_MENUBAR="compact"): How much to show in the menu bar. [compact, detailed]</swiftbar.var>
 #
 # Reads the Claude Code OAuth token from the login keychain and calls the same
 # undocumented endpoint that Claude Code's own /usage command uses.
@@ -92,6 +93,38 @@ POPOVER_H=720
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 NOW=$(date +%s)
 
+# The dropdown's toggle re-invokes this script with an argument rather than
+# shelling out to something else, which keeps the whole mechanism in one file
+# and needs no quoting gymnastics in a SwiftBar bash= parameter.
+# An absolute path to this file, for the toggle's bash= parameter. SwiftBar
+# invokes a plugin by absolute path already, but a manual run from the repo does
+# not, and a relative bash= would resolve against SwiftBar's cwd, not ours.
+case "$0" in
+  /*) SELF="$0" ;;
+  *)  SELF="$PWD/$0" ;;
+esac
+
+MENUBAR_FILE="$STATE_DIR/menubar"
+if [[ "${1:-}" == "--set-menubar" ]]; then
+  case "${2:-}" in
+    compact|detailed) printf "%s\n" "$2" > "$MENUBAR_FILE" ;;
+  esac
+  exit 0
+fi
+
+# How much the menu bar says. The toggle wins because it is the one a user can
+# reach without opening SwiftBar's settings; the SwiftBar variable sets the
+# default, so a fresh install can still be configured declaratively.
+# `read` reports failure at end of file even when it assigned, so its status is
+# deliberately not part of the test — a file without a trailing newline would
+# otherwise be silently ignored.
+MENUBAR="compact"; mb_saved=""
+[[ -r "$MENUBAR_FILE" ]] && IFS= read -r mb_saved < "$MENUBAR_FILE" 2>/dev/null
+case "$mb_saved" in
+  compact|detailed) MENUBAR="$mb_saved" ;;
+  *) [[ "${CLAUDE_USAGE_MENUBAR:-}" == "detailed" ]] && MENUBAR="detailed" ;;
+esac
+
 # ---- helpers ----------------------------------------------------------------
 
 fetched_at=0; backoff_until=0; rl_fails=0; net_fails=0; last_error=""
@@ -150,6 +183,30 @@ iso_to_epoch() {
   e=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$base" +%s 2>/dev/null) || return 1
   [[ -n "$e" ]] || return 1
   printf '%s' $(( e + adj ))
+}
+
+# "5h", "7d", "30d" — the window's length, which is what makes a bare percentage
+# mean something in the menu bar: 23% of five hours and 23% of a week are very
+# different facts, and the label is what tells them apart.
+len_label() {  # seconds
+  local s=${1:-0}
+  if (( s >= 86400 )); then printf '%dd' $(( (s + 43200) / 86400 ))
+  else                      printf '%dh' $(( (s + 1800) / 3600 ))
+  fi
+}
+
+# Time left, one decimal, for the menu bar where "2h 52m" is three characters
+# too many. Integer arithmetic so it costs no subprocess.
+rem_short() {  # seconds
+  local s=${1:-0} t
+  (( s < 0 )) && s=0
+  if (( s >= 172800 )); then
+    t=$(( s * 10 / 86400 )); printf '%d.%dd' $(( t / 10 )) $(( t % 10 ))
+  elif (( s >= 3600 )); then
+    t=$(( s * 10 / 3600 )); printf '%d.%dh' $(( t / 10 )) $(( t % 10 ))
+  else
+    printf '%dm' $(( s / 60 ))
+  fi
 }
 
 human_delta() {
@@ -246,13 +303,21 @@ done
 # otherwise. The *minimum* gap is the measurement: a session window appears to
 # start on first use, so an idle stretch stretches the gap between resets well
 # past the window itself (5.0h and 6.2h both observed for a 5h session).
+# The documented length for a kind of window. This is what the menu bar labels
+# a window with: it is a name, and a name has to be right. win_len below may
+# measure something looser — fine for placing a chart axis, wrong for telling
+# someone their session window is "6h".
+kind_len() {  # $1 kind
+  case "$1" in
+    session*) printf '%s' "$WIN_LEN_SESSION" ;;
+    monthly*) printf '%s' "$WIN_LEN_MONTHLY" ;;
+    *)        printf '%s' "$WIN_LEN_WEEKLY" ;;
+  esac
+}
+
 win_len() {  # $1 id, $2 kind
   local measured fallback
-  case "$2" in
-    session*) fallback=$WIN_LEN_SESSION ;;
-    monthly*) fallback=$WIN_LEN_MONTHLY ;;
-    *)        fallback=$WIN_LEN_WEEKLY ;;
-  esac
+  fallback=$(kind_len "$2")
   # Cycle 0 is the marker for "no resets_at", not a reset time. Left in, the
   # smallest "gap" becomes 0 -> a real epoch and the window measures ~56 years,
   # which then poisons the axis, the pace line and the pick of the longest
@@ -705,16 +770,23 @@ write_chart_html || true
 
 # Menu bar shows the short window and whichever long window is closest to
 # biting — that is the number that will actually stop you, whether the plan
-# calls it weekly, monthly, or something this script has not seen.
-session_pct=""; long_pct=""; worst=0
+# calls it weekly, monthly, or something this script has not seen. The detailed
+# form needs each one's length and reset too, so they are carried along here.
+session_pct=""; session_len=0; session_reset=""
+long_pct=""; long_len=0; long_reset=""
+worst=0
 while IFS="$SEP" read -r kind group pct reset model; do
   [[ -z "$kind" ]] && continue
   [[ "$pct" =~ ^[0-9]+$ ]] || continue
   (( pct > worst )) && worst=$pct
   if [[ "$group" == "session" || "$kind" == "session" ]]; then
-    [[ -z "$session_pct" ]] && session_pct="$pct"
+    if [[ -z "$session_pct" ]]; then
+      session_pct="$pct"; session_reset="$reset"
+      session_len=$(kind_len "$kind")
+    fi
   elif [[ -z "$long_pct" ]] || (( pct > long_pct )); then
-    long_pct="$pct"
+    long_pct="$pct"; long_reset="$reset"
+    long_len=$(kind_len "$kind")
   fi
 done <<< "$rows"
 
@@ -726,10 +798,29 @@ color=""
 (( worst >= 80 )) && color=" $WARN_COLOR"
 (( worst >= 90 )) && color=" $CRIT_COLOR"
 
-# Kept as narrow as the menu bar allows: bare numbers, no icon, no percent sign.
-mb="$session_pct"
-[[ -n "$session_pct" && -n "$long_pct" ]] && mb="${session_pct}·${long_pct}"
-[[ -z "$session_pct" ]] && mb="$long_pct"
+# "5h 23% (2.8h)" — length, usage, time left. The countdown is dropped when the
+# window has no resets_at rather than inventing one.
+mb_part() {  # $1 length seconds, $2 pct, $3 resets_at
+  local e
+  if e=$(iso_to_epoch "${3:-}"); then
+    printf '%s %s%% (%s)' "$(len_label "$1")" "$2" "$(rem_short $(( e - NOW )))"
+  else
+    printf '%s %s%%' "$(len_label "$1")" "$2"
+  fi
+}
+
+if [[ "$MENUBAR" == "detailed" ]]; then
+  mb=""
+  [[ -n "$session_pct" ]] && mb=$(mb_part "$session_len" "$session_pct" "$session_reset")
+  if [[ -n "$long_pct" ]]; then
+    mb+="${mb:+  ·  }$(mb_part "$long_len" "$long_pct" "$long_reset")"
+  fi
+else
+  # Kept as narrow as the menu bar allows: bare numbers, no icon, no percent sign.
+  mb="$session_pct"
+  [[ -n "$session_pct" && -n "$long_pct" ]] && mb="${session_pct}·${long_pct}"
+  [[ -z "$session_pct" ]] && mb="$long_pct"
+fi
 printf '%s%s | %s%s\n' "${mb:-?}" "$stale" "$FONT" "$color"
 
 printf -- '---\n'
@@ -756,6 +847,11 @@ elif [[ -n "$last_error" ]]; then
   printf '%s (data from %s ago) | %s\n' "$last_error" "$(human_delta "$age")" "$DIM"
 else
   printf 'Updated %s ago | %s\n' "$(human_delta "$age")" "$DIM"
+fi
+if [[ "$MENUBAR" == "detailed" ]]; then
+  printf 'Menu bar: detailed → make it compact | bash="%s" param1=--set-menubar param2=compact terminal=false refresh=true %s\n' "$SELF" "$POOL_ROW"
+else
+  printf 'Menu bar: compact → show more detail | bash="%s" param1=--set-menubar param2=detailed terminal=false refresh=true %s\n' "$SELF" "$POOL_ROW"
 fi
 printf 'Refresh now | refresh=true\n'
 printf 'Reveal cached response | bash=/usr/bin/open param1=-R param2="%s" terminal=false\n' "$CACHE"

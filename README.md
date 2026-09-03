@@ -14,6 +14,29 @@ signs, no icon — three characters most of the time. The text turns amber at
 Clicking opens the full breakdown — one line per window, with meters and reset
 countdowns, and any of them opens an interactive chart of that window's history.
 
+## Menu bar detail
+
+A crowded laptop menu bar and a 34" monitor do not want the same thing, so the
+menu bar text has two forms:
+
+```
+compact    1·8
+detailed   5h 23% (2.8h)  ·  7d 22% (2.5d)
+```
+
+Detailed labels each window by its **length** rather than its name — `5h`, `7d`,
+`30d` — because that is what makes a bare percentage mean something: 23% of five
+hours and 23% of a week are very different facts. The bracketed figure is how
+long that window has left. On a monthly plan it reads `30d 37% (19.9d)`.
+
+Switch it from the dropdown — **Menu bar: compact → show more detail** — which
+remembers the choice per machine in a `menubar` file in the state directory.
+
+Until you use that toggle the default comes from a SwiftBar plugin variable,
+`CLAUDE_USAGE_MENUBAR`, editable in SwiftBar's own plugin settings. The first
+click takes over for good: the saved file wins from then on, so changing the
+variable afterwards does nothing until you delete that file.
+
 ## Plans
 
 The endpoint reports whichever windows an account actually has, and the plugin
@@ -82,9 +105,10 @@ Windows come from the response's `limits[]` array; the older `five_hour` /
 `seven_day` fields are used as a fallback if that array ever disappears.
 
 State lives in `${XDG_CACHE_HOME:-~/.cache}/claude-usage-swiftbar/` — the last
-good response, the backoff bookkeeping, the usage history and the generated
-chart page — in a `0700` directory. The state file is parsed, never sourced, so
-a corrupt or tampered one cannot become shell code or wedge the plugin.
+good response, the backoff bookkeeping, the usage history, the menu bar choice
+and the generated chart page — in a `0700` directory. The state file is parsed,
+never sourced, so a corrupt or tampered one cannot become shell code or wedge
+the plugin.
 
 ## History and charts
 
