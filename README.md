@@ -11,8 +11,8 @@ Short window first, then whichever long window is closest to biting. No percent
 signs, no icon — three characters most of the time. The text turns amber at
 80% and red at 90%, and a trailing `⋯` means the numbers are stale.
 
-Clicking opens the full breakdown — every window the account has, with meters
-and reset countdowns. Only the menu bar item is constrained; the dropdown is not.
+Clicking opens the full breakdown — one line per window, with meters and reset
+countdowns, and any of them opens an interactive chart of that window's history.
 
 ## Plans
 
@@ -82,62 +82,78 @@ Windows come from the response's `limits[]` array; the older `five_hour` /
 `seven_day` fields are used as a fallback if that array ever disappears.
 
 State lives in `${XDG_CACHE_HOME:-~/.cache}/claude-usage-swiftbar/` — the last
-good response, the backoff bookkeeping and the usage history — in a `0700`
-directory. The state file is parsed, never sourced, so a corrupt or tampered one
-cannot become shell code or wedge the plugin.
+good response, the backoff bookkeeping, the usage history and the generated
+chart page — in a `0700` directory. The state file is parsed, never sourced, so
+a corrupt or tampered one cannot become shell code or wedge the plugin.
 
-## History
+## History and charts
 
 The plugin polls on the interval in its filename whether or not you ever open
 the menu — that is what keeps the menu bar number current — so it can keep a
 record for free. Every successful fetch appends one row per window to
-`history.tsv` in the state directory, and the dropdown draws the current cycle
-underneath each meter:
+`history.tsv` in the state directory.
+
+The dropdown stays one line per window:
 
 ```
-Weekly (all)        68% ███████░░░
-                        resets in 3d 0h  (Sat 15:00)
-                        ▁▁▁▁▁▂▂▂▃▃▃▄▄▄▅▅▅▆▆▆▇▇▇█  60→68%  over 6h 0m
-                        ··▅▆██▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▅  0→1.8 %/h  now 1.0 · 100% in 1d 8h
+Session             15% ██░░░░░░░░  resets in 3h 3m    (Thu 06:59)
+Weekly (all)        21% ██░░░░░░░░  resets in 2d 11h   (Sat 14:59)
+Weekly (Fable)       0% ░░░░░░░░░░  no active window
 ```
 
-The top sparkline is utilization, the bottom one is how fast it is climbing, and
-each is labelled with the range it is drawn across — neither is scaled to a
-fixed 0–100%, or a window sitting at 8% would be a flat line on the floor. The
-tail is the burn rate over the last hour and what it implies: `100% in 1d 8h`,
-or `resets first` when the window turns over before the quota runs out, or
-`idle` for a window that has not moved in an hour, or `rate unknown` when the
-last hour holds too few samples to say — which is what it says after a long
-sleep, rather than averaging a fresh burn away across the gap.
+Clicking any of them opens a chart window, at that window's section. It is a
+local HTML page in the state directory, opened in SwiftBar's WebView: inline
+SVG, inline script, no network and no CDN. Moving the cursor across a chart
+tracks the nearest sample and reads out its time and value.
 
-Charts appear once an hour of the *current cycle* is on record, and read
-`gathering history…` until then. That includes the first hour after every reset,
-not just the first hour after install.
+Each window gets two charts, and **both axes are fixed rather than fitted to the
+data**. That is the whole design:
 
-Four things the drawing is careful about, because the underlying data does not
-support naivety:
+- **Utilization runs 0–100%.** A chart scaled to its own range answers "what
+  shape was my usage"; the question that matters is "how close am I to the
+  limit". A quiet cycle therefore draws a flat line near the floor, which is the
+  honest picture rather than a defect.
+- **Time runs the full window, start to reset**, so the horizontal position
+  shows how far through the window you are. The stretch before the first sample
+  is left blank — that is where the plugin was not watching.
+- **The rate chart is scaled against pace**, the burn rate that would exactly
+  exhaust the window (`100% / length`), drawn as a dashed line. Above it, this
+  window ends early; below it, there will be quota to spare. A rate chart cannot
+  use a 0–100% axis, and pace is the fixed reference that replaces it.
 
-- **Cycles are charted separately.** These windows reset, so one continuous line
-  across a reset would be a sawtooth and its derivative would be all cliffs.
-  Each chart covers the current cycle only, and `over 6h 0m` says how much of
-  that cycle has actually been observed — a window that reset before you
-  installed the plugin charts from first sample, not from the reset.
-- **Gaps are drawn as gaps.** SwiftBar does not run while the Mac sleeps and the
-  fetch backs off after a 429, so samples are unevenly spaced. Bins are by
-  wall-clock time and never narrower than one poll, and a bin with no sample is
-  `·` rather than a carried-forward flat line — quota can move while we are not
-  looking. The rate row needs a real sample at *both* ends of its difference, so
-  it stays blank across a gap and for a while after one instead of charging
-  everything the gap hid to the first bin back.
-- **Rates are differenced across a span of bins, then smoothed** — half an hour
-  where bins are narrower than that, one bin where they are wider. The API
-  reports whole percents, so consecutive 180s samples differ by 0 or 1 and a
-  per-sample derivative is quantisation noise rather than a burn rate.
-- **Both sparklines are scaled to their own series.** `60→68%` and `0→1.8 %/h`
-  state the observed range, so a tall bar means "high for this cycle", not "near
-  the limit" — the number beside the meter is the absolute one. A range narrower
-  than 4 points is drawn over a 4-point span, so a 1% wobble is not stretched
-  into a climb and does not reach the top of the chart.
+A gap in the samples stays a gap: sleep, a 429 backoff and an expired token all
+cost samples, and the line breaks rather than guessing across them. Rates are
+differenced over a trailing window and not across a long gap, because the API
+reports whole percents — consecutive samples differ by 0 or 1, so a per-sample
+derivative is quantisation noise rather than a burn rate.
+
+### Where the window starts
+
+Charts need the window's start and the API reports only when it ends. The
+length is measured from history once two of a window's resets have been seen,
+using the **minimum** gap between them: a session window appears to start on
+first use, so an idle stretch stretches the gap well past the window itself
+(5.0h and 6.2h have both been observed for a 5h session). Until then it falls
+back to the documented length for the kind — 5h, 7d, 30d.
+
+### Today
+
+A plan whose **longest** window runs two weeks or more — an enterprise monthly
+window, say — also gets a **Today** section, local midnight to midnight, with a
+cumulative chart and a rate chart. A day disappears inside a month, so it earns
+its place there; against a weekly window it does not, and the five-hour session
+window already answers "what have I been doing lately". The test is on the
+longest window rather than the shortest, so a plan reporting *session and
+monthly* still gets Today, and a weekly plan never does.
+
+Today is *derived*, not reported: the API has no daily window, so it accumulates
+the positive steps of the longest window since local midnight, counting a reset
+only when the figure actually falls. Anything that costs samples — sleep,
+backoff, an expired token — makes it a floor rather than a total, and it says
+so. Its axes are the two exceptions to the fixed-axis rule above: the cumulative
+chart is scaled to an even day's share of the window (`100% / 30` for a monthly
+one) rather than to 0–100%, since a day is never a large fraction of a month,
+and that share is drawn as the reference line.
 
 `history.tsv` is tab-separated `epoch`, `window`, `percent`, `cycle` — plottable
 with anything — pruned to 30 days (about 1.7 MB) and openable from **Reveal
@@ -168,8 +184,10 @@ your Claude Code login.
   rendering above is the defence against that, but if something looks wrong,
   use **Reveal cached response** in the dropdown to inspect the raw JSON.
 - Enterprise support is written against the response shape, not against a real
-  enterprise account — the author has none to test with. If the numbers don't
-  match your Claude Code settings → usage page, the raw JSON will say why.
+  enterprise account — the author has none to test with. That includes the
+  monthly window and the Today charts it unlocks, which are exercised against a
+  synthetic response rather than a live plan. If the numbers don't match your
+  Claude Code settings → usage page, the raw JSON will say why.
 - Only utilization percentages are available. `limit_dollars` and `used_dollars`
   come back `null` on subscription plans, so there is no absolute "X of Y".
 - The poll interval is encoded in the filename (`.180s.`). 180s is what the

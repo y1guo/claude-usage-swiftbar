@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # <bitbar.title>Claude Code Usage</bitbar.title>
-# <bitbar.version>1.3.0</bitbar.version>
+# <bitbar.version>1.4.0</bitbar.version>
 # <bitbar.author>y1guo</bitbar.author>
 # <bitbar.author.github>y1guo</bitbar.author.github>
 # <bitbar.desc>Claude Code session and weekly/monthly rate-limit utilization in the menu bar.</bitbar.desc>
@@ -31,18 +31,26 @@ STATE="$STATE_DIR/state"
 # collapse runs the way bash's IFS does, none of its four fields can be empty,
 # and a tab keeps the file plottable with anything.
 HISTORY="$STATE_DIR/history.tsv"
+CHART_HTML="$STATE_DIR/chart.html"
 
-# One row per window per successful fetch. 24 bins is what fits beside the
-# 24-column indent the sub-rows use; 30 days at a 180s poll is ~1.7 MB.
-#
-# HIST_MIN_BIN must track the poll interval in this file's name: a bin narrower
-# than one poll is empty by construction. HIST_MIN_SPAN is how much of a cycle
-# has to be on record before anything is drawn at all.
-HIST_BINS=24
-HIST_MIN_BIN=180
-HIST_MIN_SPAN=3600
+# One row per window per successful fetch; 30 days at a 180s poll is ~1.7 MB.
 HIST_KEEP=$(( 30 * 86400 ))
 HIST_PRUNE_EVERY=86400
+
+# Charts need the window's start, and the API only reports when it ends. These
+# are the documented lengths per kind, used until the history has seen two
+# resets of a window and can measure it (see win_len). Deliberately a fallback,
+# not an assumption: an unknown kind gets the weekly length and a chart whose
+# x-axis is merely wrong, rather than no chart.
+WIN_LEN_SESSION=$(( 5 * 3600 ))
+WIN_LEN_WEEKLY=$(( 7 * 86400 ))
+WIN_LEN_MONTHLY=$(( 30 * 86400 ))
+
+# Today is for plans whose only long window is so long that a day disappears
+# inside it. Keyed on the longest window rather than the shortest: a monthly
+# plan gets Today whether or not it also reports a session window, and a weekly
+# plan never does, because its session window already shows recent detail.
+TODAY_MIN_WINDOW=$(( 14 * 86400 ))
 
 # Field separator between jq and the read loops. Deliberately NOT a tab: tab is
 # an IFS whitespace character, so bash collapses runs of them and an empty field
@@ -52,19 +60,14 @@ SEP=$'\x1f'
 # The menu bar title carries no colour below 80%, so macOS inverts it when the
 # menu opens; the warn and crit shades below deliberately override that.
 FONT="font=Menlo size=12"
-
-# Dropdown rows carry an explicit colour, and not only for contrast: SwiftBar
-# gives a line a click target only when it has an action *or* a colour
-# (configureAction in MenuBarItem.swift), and AppKit greys out a menu item whose
-# target is nil. A plain uncoloured text row therefore renders as a disabled
-# item — washed out next to SwiftBar's own entries. Pairs are light,dark.
+# A dropdown row needs a colour or an action, or SwiftBar gives it no click
+# target (configureAction in MenuBarItem.swift) and AppKit greys it out — a
+# plain uncoloured row renders as a disabled item, washed out next to SwiftBar's
+# own entries. DIM is for the rows that have no action; POOL_ROW below is for
+# the ones that do. Colour pairs are light,dark.
 #
-# trim=false is what makes the indentation below real: SwiftBar strips leading
-# whitespace from a title unless asked not to (MenuBarItem.swift), so every
-# padded row would otherwise collapse against the left margin and the columns
-# would line up only in the source. Both sizes are 12 for the same reason — one
-# monospace grid, or the padding means a different width on each row.
-ROW="font=Menlo size=12 color=#1d1d1f,#f5f5f7 trim=false"
+# trim=false keeps the leading spaces SwiftBar would otherwise strip
+# (MenuBarItem.swift), which is what lets a padded row hold its column.
 DIM="font=Menlo size=12 color=#5f5f66,#a8a8b0 trim=false"
 
 # Amber and red at the menu bar, darkened for the light menu bar where the
@@ -72,9 +75,19 @@ DIM="font=Menlo size=12 color=#5f5f66,#a8a8b0 trim=false"
 WARN_COLOR="color=#b35a00,#ff9f0a"   # >= 80%
 CRIT_COLOR="color=#bf2d24,#ff453a"   # >= 90%
 
-# Everything under a window label starts in the same column as its meter:
-# 18 for the label field, then the width of the " %3d%% " that precedes a bar.
-PAD="                        "
+# A pool row carries an action (it opens the chart popover) rather than a
+# colour. Either one stops SwiftBar drawing the row as disabled, but a colour
+# also makes menu(_:willHighlight:) rebuild the row's attributedTitle as bare
+# text the moment the highlight touches it — harmless for text, fatal for any
+# row holding an image. Carrying the action instead keeps that path away from
+# us and lets macOS pick the label colour, which is more correct anyway.
+POOL_ROW="font=Menlo size=12 trim=false"
+
+# Sized to fit a 13" MacBook (1440x900 points) under the menu bar without the
+# popover itself being clipped; past three pools the page scrolls, which is the
+# right trade — a per-model weekly window can push a subscription to four.
+POPOVER_W=620
+POPOVER_H=720
 
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 NOW=$(date +%s)
@@ -184,25 +197,35 @@ label_for() {
 # SwiftBar treats "|" as its parameter separator and honours bash=/param= on any
 # line, so labels that came from the API are stripped of it before rendering.
 # A percentage that did not survive parsing is shown as unknown, never as 0%.
-meter_row() {
-  local label="${1//[|$'\n']/ }" pct="${2:-}"
+#
+# One line per pool: label, percentage, bar, and when it resets. Clicking it
+# opens the chart popover at that pool's section.
+pool_row() {  # $1 label, $2 pct, $3 resets_at ("none" = not a window), $4 anchor
+  local label="${1//[|$'\n']/ }" pct="${2:-}" bar tail epoch action
   if [[ "$pct" =~ ^[0-9]+$ ]]; then
-    printf '%-18s %3d%% %s | %s\n' "$label" "$pct" "$(meter "$pct")" "$ROW"
+    bar=$(printf '%3d%% %s' "$pct" "$(meter "$pct")")
   else
-    printf '%-18s   ?%% unreadable | %s\n' "$label" "$ROW"
+    bar='  ?% unreadable'
   fi
-}
-
-window_row() {
-  local epoch delta
-  meter_row "$1" "$2"
-  if epoch=$(iso_to_epoch "${3:-}"); then
-    delta=$(( epoch - NOW ))
-    printf '%sresets in %s  (%s) | %s\n' "$PAD" "$(human_delta "$delta")" \
-      "$(date -r "$epoch" '+%a %H:%M')" "$DIM"
+  if [[ "${3:-}" == "none" ]]; then
+    # Extra usage is a spending pool, not a rate-limit window; it has no reset
+    # and saying "no active window" about it would be a plain falsehood.
+    tail=""
+  elif epoch=$(iso_to_epoch "${3:-}"); then
+    tail=$(printf 'resets in %-8s (%s)' "$(human_delta "$(( epoch - NOW ))")" \
+      "$(date -r "$epoch" '+%a %H:%M')")
   else
-    printf '%sno active window | %s\n' "$PAD" "$DIM"
+    tail="no active window"
   fi
+  # Every window row is clickable, including one with nothing to plot: the
+  # popover gives it a section saying why, which beats a row that looks broken.
+  # Extra usage has no history series, so it gets no anchor and no link.
+  if [[ -n "${4:-}" && -s "$CHART_HTML" ]]; then
+    action="href=file://$CHART_HTML#$4 webview=true webvieww=$POPOVER_W webviewh=$POPOVER_H $POOL_ROW"
+  else
+    action="$DIM"
+  fi
+  printf '%-18s %s  %s | %s\n' "$label" "$bar" "$tail" "$action"
 }
 
 die() {  # menu-bar text as $1, explanation lines on stdin
@@ -217,6 +240,291 @@ die() {  # menu-bar text as $1, explanation lines on stdin
 for dep in curl jq security; do
   command -v "$dep" >/dev/null 2>&1 || die "⚠️ deps" <<< "$dep not found on PATH | $DIM"
 done
+
+# How long this window runs. The API says only when it ends, so measure it when
+# the history holds two of its resets and fall back to the documented length
+# otherwise. The *minimum* gap is the measurement: a session window appears to
+# start on first use, so an idle stretch stretches the gap between resets well
+# past the window itself (5.0h and 6.2h both observed for a 5h session).
+win_len() {  # $1 id, $2 kind
+  local measured fallback
+  case "$2" in
+    session*) fallback=$WIN_LEN_SESSION ;;
+    monthly*) fallback=$WIN_LEN_MONTHLY ;;
+    *)        fallback=$WIN_LEN_WEEKLY ;;
+  esac
+  # Cycle 0 is the marker for "no resets_at", not a reset time. Left in, the
+  # smallest "gap" becomes 0 -> a real epoch and the window measures ~56 years,
+  # which then poisons the axis, the pace line and the pick of the longest
+  # window. So: positive cycles only, and the answer has to be the right order
+  # of magnitude for the kind or it is not an answer.
+  measured=$(awk -F'\t' -v id="$1" '
+    $2 == id && $4 + 0 > 0 && !($4 in seen) { seen[$4] = 1; c[++n] = $4 + 0 }
+    END {
+      if (n < 2) exit 1
+      for (i = 1; i < n; i++) for (j = i + 1; j <= n; j++)
+        if (c[j] < c[i]) { t = c[i]; c[i] = c[j]; c[j] = t }
+      best = 0
+      for (i = 2; i <= n; i++) { d = c[i] - c[i - 1]; if (d > 0 && (best == 0 || d < best)) best = d }
+      if (best <= 0) exit 1
+      print best
+    }' "$HISTORY" 2>/dev/null)
+  if [[ "$measured" =~ ^[0-9]+$ ]] \
+     && (( measured >= 600 && measured >= fallback / 4 && measured <= fallback * 4 )); then
+    printf '%s' "$measured"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+# "[t,pct],[t,pct],..." for one window's current cycle; fails if too few points.
+samples_json() {  # $1 id, $2 cycle
+  awk -F'\t' -v id="$1" -v cyc="$2" '
+    $1 ~ /^[0-9]+$/ && $2 == id && ($4 + 0) == cyc { n++; printf "%s[%d,%d]", (n > 1 ? "," : ""), $1, $3 }
+    END { if (n < 2) exit 1 }' "$HISTORY" 2>/dev/null
+}
+
+# Today, derived rather than reported: the API has no daily window, so this
+# accumulates the positive steps of a long window since local midnight. A step
+# is only counted within one cycle; when the cycle changes the window reset
+# today, so everything it has accrued since is today's. Sleep, a 429 backoff or
+# an expired token all cost samples here, which makes this a floor, not a total.
+today_json() {  # $1 id, $2 midnight epoch
+  awk -F'\t' -v id="$1" -v t0="$2" '
+    $1 ~ /^[0-9]+$/ && $2 == id && $1 + 0 >= t0 {
+      t = $1 + 0; v = $3 + 0; c = $4 + 0
+      if (seen) {
+        # A changed cycle key only means a reset if the value actually fell.
+        # resets_at can shift for other reasons, and adding the whole current
+        # figure then would invent usage — the one direction the caption on
+        # this section ("gaps under-count") promises cannot happen.
+        if (c != pc && v < pv) cum += v
+        else if (v > pv) cum += v - pv
+      }
+      seen = 1; pv = v; pc = c
+      printf "%s[%d,%.2f]", (n++ ? "," : ""), t, cum
+    }
+    END { if (n < 2) exit 1 }' "$HISTORY" 2>/dev/null
+}
+
+# The chart popover: a self-contained local page, no network and no CDN, opened
+# by SwiftBar in a WKWebView when a pool row is clicked.
+#
+# Both axes are fixed rather than fitted to the data, which is the whole point:
+# a chart scaled to its own range answers "what shape was my usage", and the
+# question that actually matters is "how close am I to the limit, and how far
+# through the window". So utilisation runs 0-100% and time runs the full window,
+# start to reset. A low cycle therefore draws a flat line near the floor — that
+# is the honest picture, not a defect.
+#
+# Every pool row in the menu links here, so every pool needs a section. Returns
+# non-zero when there was nothing to chart at all, which is not an error.
+write_chart_html() {
+  local kind group pct reset model id cycle epoch len label pts note
+  local pools="" primary="" plen=0 today="" today_js="null" midnight tomorrow
+  while IFS="$SEP" read -r kind group pct reset model; do
+    [[ -z "$kind" ]] && continue
+    id=$(win_id "$kind" "$model")
+    label=$(label_for "$kind" "$model")
+    # This lands in a JS string literal *and* in innerHTML, so it has to survive
+    # both: quotes and backslashes would break the literal, angle brackets and
+    # ampersands would inject markup into the page. The model name comes from an
+    # undocumented API, so it is whitelisted down rather than trusted.
+    label="${label//[\"\\<>\&$'\n'$'\r']/ }"
+    # Every pool gets a section, charted or not, so that every row in the menu
+    # opens something rather than appearing dead when it has nothing to draw.
+    if ! cycle=$(cycle_key "$reset") || ! epoch=$(iso_to_epoch "$reset"); then
+      note="No active window on this plan right now, so there is nothing to chart."
+    elif ! pts=$(samples_json "$id" "$cycle"); then
+      note="Gathering history. This window reset recently, and a chart needs a few samples."
+    else
+      note=""
+    fi
+    if [[ -n "$note" ]]; then
+      pools+="${pools:+,}{\"id\":\"$id\",\"label\":\"$label\",\"note\":\"$note\"}"
+      continue
+    fi
+    len=$(win_len "$id" "$kind")
+    pools+="${pools:+,}{\"id\":\"$id\",\"label\":\"$label\",\"reset\":$epoch,\"len\":$len,\"p\":[$pts]}"
+    if (( len > plen )); then primary="$id"; plen=$len; fi
+  done <<< "$rows"
+  [[ -n "$pools" ]] || return 1
+
+  # Today is only built when nothing shorter than a day is already charted: a
+  # A day is a meaningful slice of a month and not of a week, and the scan is not
+  # free. The page applies the same rule, so the two cannot disagree.
+  midnight=$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date '+%Y-%m-%d') 00:00:00" +%s 2>/dev/null) || midnight=0
+  # Tomorrow's local midnight rather than midnight+86400: a DST day is 23 or 25
+  # hours long, and the fixed axis would clip or overrun by an hour.
+  tomorrow=$(date -j -v+1d -f '%Y-%m-%d %H:%M:%S' "$(date '+%Y-%m-%d') 00:00:00" +%s 2>/dev/null) \
+    || tomorrow=$(( midnight + 86400 ))
+  if [[ -n "$primary" ]] && (( midnight > 0 && plen >= TODAY_MIN_WINDOW )); then
+    today=$(today_json "$primary" "$midnight") || today=""
+    [[ -n "$today" ]] && today_js="[$today]"
+  fi
+
+  {
+    cat <<'HEAD'
+<!doctype html><meta charset="utf-8"><title>Claude usage</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--fg:#1d1d1f;--dim:#6e6e73;--grid:#dcdce1;
+      --line:#0a6cff;--fill:#0a6cff1f;--ref:#c2610a}
+@media(prefers-color-scheme:dark){:root{--bg:#1e1e1e;--fg:#f5f5f7;--dim:#9a9aa0;
+      --grid:#3a3a3c;--line:#64a8ff;--fill:#64a8ff26;--ref:#ff9f0a}}
+*{box-sizing:border-box}
+body{margin:0;padding:4px 14px 14px;background:var(--bg);color:var(--fg);
+     font:12px -apple-system,BlinkMacSystemFont,sans-serif}
+section{padding-top:10px}
+h2{font-size:13px;font-weight:600;margin:0}
+.sub{color:var(--dim);font-size:11px;margin:1px 0 3px}
+.rd{color:var(--dim);font-size:11px;height:14px;margin-top:1px;font-variant-numeric:tabular-nums}
+.note{color:var(--dim);font-size:11px;padding:10px 0 4px}
+svg{display:block;width:100%}
+text{fill:var(--dim);font-size:9px;font-family:-apple-system,sans-serif}
+</style><div id=c></div><script>
+HEAD
+    # "null", never the empty string: an unset TODAY would emit `const TODAY=;`
+    # and a single syntax error takes the whole page down, charts included.
+    printf 'const POOLS=[%s];\nconst TODAY=%s;\nconst NOW=%d;\nconst DAY0=%d;\nconst DAY1=%d;\nconst PRIMARY=%s;\nconst TODAY_MIN=%d;\n' \
+      "$pools" "$today_js" "$NOW" "$midnight" "$tomorrow" "\"${primary:-}\"" "$TODAY_MIN_WINDOW"
+    cat <<'TAIL'
+const host = document.getElementById('c');
+const clock = t => new Date(t*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+const stamp = t => new Date(t*1000).toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'});
+const GAP = 600;   // seconds without a sample that count as "not observed"
+
+// One chart. Axes are given, never fitted; a series is drawn as separate
+// subpaths so a gap in the samples stays a gap on the page.
+function chart(parent, o) {
+  const W = 560, H = o.h || 96, L = 38, R = 8, T = 8, B = 16;
+  const px = t => L + (t - o.x0) / (o.x1 - o.x0) * (W - L - R);
+  const py = v => T + (1 - v / o.y1) * (H - T - B);
+  let d = '', area = '', run = [];
+  const flush = () => {
+    if (!run.length) return;
+    const pts = run.map(q => px(q[0]).toFixed(1) + ' ' + py(q[1]).toFixed(1)).join('L');
+    d += 'M' + pts + ' ';
+    if (o.fill) area += 'M' + px(run[0][0]).toFixed(1) + ' ' + py(0) + 'L' + pts +
+                        'L' + px(run[run.length-1][0]).toFixed(1) + ' ' + py(0) + 'Z';
+    run = [];
+  };
+  let prev = null;
+  for (const q of o.series) { if (prev !== null && q[0] - prev > GAP) flush(); run.push(q); prev = q[0]; }
+  flush();
+
+  const bits = [];
+  for (const g of o.yticks) bits.push(
+    '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+py(g).toFixed(1)+'" y2="'+py(g).toFixed(1)+
+    '" stroke="var(--grid)" stroke-width="1"/>' +
+    '<text x="'+(L-5)+'" y="'+(py(g)+3).toFixed(1)+'" text-anchor="end">'+o.fmt(g)+'</text>');
+  if (o.ref != null && o.ref <= o.y1) bits.push(
+    '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+py(o.ref).toFixed(1)+'" y2="'+py(o.ref).toFixed(1)+
+    '" stroke="var(--ref)" stroke-width="1" stroke-dasharray="4 3"/>' +
+    '<text x="'+(W-R)+'" y="'+(py(o.ref)-3).toFixed(1)+'" text-anchor="end" fill="var(--ref)">'+o.refLabel+'</text>');
+  if (o.fill) bits.push('<path d="'+area+'" fill="var(--fill)"/>');
+  bits.push('<path d="'+d+'" fill="none" stroke="var(--line)" stroke-width="1.7" stroke-linejoin="round"/>');
+  if (NOW >= o.x0 && NOW <= o.x1) bits.push(
+    '<line x1="'+px(NOW).toFixed(1)+'" x2="'+px(NOW).toFixed(1)+'" y1="'+T+'" y2="'+(H-B)+
+    '" stroke="var(--dim)" stroke-width="1" stroke-dasharray="1 3"/>');
+  for (const [t, anchor] of [[o.x0,'start'],[o.x1,'end']]) bits.push(
+    '<text x="'+px(t).toFixed(1)+'" y="'+(H-4)+'" text-anchor="'+anchor+'">'+o.xfmt(t)+'</text>');
+  bits.push('<line class=cx y1="'+T+'" y2="'+(H-B)+'" stroke="var(--dim)" stroke-dasharray="3 3" style="display:none"/>');
+  bits.push('<circle class=dot r="2.8" fill="var(--line)" style="display:none"/>');
+
+  const el = document.createElement('div');
+  el.innerHTML = '<svg viewBox="0 0 '+W+' '+H+'">'+bits.join('')+'</svg><div class=rd>&nbsp;</div>';
+  parent.appendChild(el);
+  if (!o.series.length) return;
+  const svg = el.querySelector('svg'), cx = el.querySelector('.cx'),
+        dot = el.querySelector('.dot'), rd = el.querySelector('.rd');
+  svg.addEventListener('mousemove', e => {
+    const r = svg.getBoundingClientRect(), fx = (e.clientX - r.left) / r.width * W;
+    let best = null, bd = 1e9;
+    for (const q of o.series) { const dd = Math.abs(px(q[0]) - fx); if (dd < bd) { bd = dd; best = q; } }
+    if (!best) return;
+    cx.setAttribute('x1', px(best[0])); cx.setAttribute('x2', px(best[0])); cx.style.display = '';
+    dot.setAttribute('cx', px(best[0])); dot.setAttribute('cy', py(best[1])); dot.style.display = '';
+    rd.textContent = stamp(best[0]) + ' — ' + o.read(best[1]);
+  });
+  svg.addEventListener('mouseleave', () => {
+    cx.style.display = 'none'; dot.style.display = 'none'; rd.innerHTML = '&nbsp;';
+  });
+}
+
+// Burn rate over a trailing window, never across a gap: without both ends being
+// real samples the "rate" is just the gap's total charged to one instant.
+function rates(p, win) {
+  const out = []; let a = 0;
+  for (let i = 0; i < p.length; i++) {
+    while (a + 1 < i && p[i][0] - p[a + 1][0] >= win) a++;
+    const dt = p[i][0] - p[a][0];
+    if (dt < win || dt > win * 3) continue;
+    out.push([p[i][0], Math.max(0, (p[i][1] - p[a][1]) * 3600 / dt)]);
+  }
+  return out;
+}
+
+function section(id, title, sub) {
+  const s = document.createElement('section');
+  s.id = id;
+  s.innerHTML = '<h2>' + title + '</h2>' + (sub ? '<div class=sub>' + sub + '</div>' : '');
+  host.appendChild(s);
+  return s;
+}
+
+let longest = 0;
+for (const s of POOLS) {
+  if (s.note) { section(s.id, s.label, '').innerHTML += '<div class=note>' + s.note + '</div>'; continue; }
+  longest = Math.max(longest, s.len);
+  const start = s.reset - s.len, pace = 100 / (s.len / 3600);
+  const through = Math.min(100, Math.max(0, (NOW - start) / s.len * 100));
+  const sec = section(s.id, s.label,
+    s.p[s.p.length-1][1] + '% used · ' + through.toFixed(0) + '% through the window · resets ' + stamp(s.reset));
+
+  chart(sec, {
+    x0: start, x1: s.reset, y1: 100, series: s.p, fill: true,
+    yticks: [0, 50, 100], fmt: v => v + '%', xfmt: clock,
+    read: v => v + '% of the window',
+  });
+  const rr = rates(s.p, Math.max(1800, s.len / 48));
+  chart(sec, {
+    x0: start, x1: s.reset, h: 70,
+    y1: Math.max(pace * 2, rr.reduce((m, q) => Math.max(m, q[1]), 0) * 1.15, 0.01),
+    series: rr, ref: pace, refLabel: 'pace to use it all',
+    yticks: [0], fmt: () => '%/h', xfmt: clock,
+    read: v => v.toFixed(2) + ' %/h',
+  });
+}
+
+// Today earns its place only when the long window is long enough for a day to
+// vanish inside it. Same threshold the shell used to decide whether to gather
+// the data, so the two cannot disagree.
+if (TODAY && TODAY.length > 1 && longest >= TODAY_MIN) {
+  const pool = POOLS.find(p => p.id === PRIMARY) || POOLS[0];
+  const share = 100 / (pool.len / (DAY1 - DAY0));   // an even day of this window
+  const pace = 100 / (pool.len / 3600);
+  const used = TODAY[TODAY.length - 1][1];
+  const sec = section('today', 'Today',
+    used.toFixed(1) + '% of ' + pool.label + ' used since midnight · observed only, gaps under-count');
+  chart(sec, {
+    x0: DAY0, x1: DAY1, y1: Math.max(share * 1.25, used * 1.15, 0.01),
+    series: TODAY, fill: true, ref: share, refLabel: 'an even day',
+    yticks: [0], fmt: () => '%', xfmt: clock,
+    read: v => v.toFixed(1) + '% of ' + pool.label,
+  });
+  const tr = rates(TODAY, 1800);
+  chart(sec, {
+    x0: DAY0, x1: DAY1, h: 70,
+    y1: Math.max(pace * 2, tr.reduce((m, q) => Math.max(m, q[1]), 0) * 1.15, 0.01),
+    series: tr, ref: pace, refLabel: 'pace to use it all',
+    yticks: [0], fmt: () => '%/h', xfmt: clock,
+    read: v => v.toFixed(2) + ' %/h',
+  });
+}
+</script>
+TAIL
+  } > "$CHART_HTML.$$" && mv -f "$CHART_HTML.$$" "$CHART_HTML"
+}
 
 # ---- history ----------------------------------------------------------------
 
@@ -237,183 +545,6 @@ cycle_key() {
   local e
   e=$(iso_to_epoch "${1:-}") || return 1
   printf '%s' $(( (e + 150) / 300 * 300 ))
-}
-
-# One pass over the history file for every window at once, because the render
-# path runs on every SwiftBar tick and the file is tens of thousands of lines.
-#
-# Samples are binned by wall-clock time, not by index: SwiftBar does not run
-# while the Mac sleeps and the fetch backs off after a 429, so the gaps between
-# samples are uneven and drawing them evenly spaced would misstate every slope.
-# A bin with no sample is drawn as a gap rather than carried forward — quota can
-# move while we are not looking, so a flat line there would be an invention.
-#
-# Rates are differenced across a span of bins rather than between adjacent
-# samples: the API reports whole percents, so consecutive samples differ by 0 or
-# 1 and a per-sample derivative is quantisation noise, not a burn rate. That
-# span is half an hour where bins are narrower than that, one bin where they are
-# wider, and never more than a quarter of the chart.
-history_series() {  # spec: "id|cycle_epoch;..." -> one SEP-separated row per id
-  [[ -s "$HISTORY" ]] || return 0
-  awk -v now="$NOW" -v nb="$HIST_BINS" -v minbin="$HIST_MIN_BIN" -v minspan="$HIST_MIN_SPAN" \
-      -v spec="$1" -v sep="$SEP" '
-    BEGIN {
-      FS = "\t"
-      L[0]="▁"; L[1]="▂"; L[2]="▃"; L[3]="▄"; L[4]="▅"; L[5]="▆"; L[6]="▇"; L[7]="█"
-      GAP = "·"
-      ni = split(spec, it, ";")
-      for (i = 1; i <= ni; i++) {
-        if (split(it[i], kv, "|") != 2) continue
-        want[kv[1]] = 1; cyc[kv[1]] = kv[2] + 0; ord[++no] = kv[1]
-      }
-    }
-    # Only the current cycle: these windows reset, so splicing cycles together
-    # would draw a sawtooth and a derivative full of cliffs.
-    $1 ~ /^[0-9]+$/ && ($2 in want) && ($4 + 0) == cyc[$2] {
-      k = ++cnt[$2]; T[$2, k] = $1 + 0; P[$2, k] = $3 + 0
-    }
-    END {
-      # One format for every row, sentinel included, so the column count cannot
-      # drift between the two places that emit one.
-      fmt = "%s%s%d%s%s%s%s%s%s%s%d%s%d%s%s%s%s\n"
-      for (i = 1; i <= no; i++) {
-        id = ord[i]; m = cnt[id] + 0
-        # start is a min-scan rather than T[id,1]: the file is append-ordered
-        # only while the clock moves forward.
-        start = 0
-        if (m >= 2) {
-          start = T[id, 1]
-          for (k = 2; k <= m; k++) if (T[id, k] < start) start = T[id, k]
-        }
-        # Nothing is drawn for the first hour of a cycle. A chart over three
-        # minutes of samples is not a chart, and a rate extrapolated from the
-        # single whole percent that landed in them is not a rate.
-        if (m < 2 || now - start < minspan) {
-          printf fmt, id, sep, 0, sep, "-", sep, "-", sep, "-", sep, 0, sep, 0, sep, "-", sep, "-"
-          continue
-        }
-        span = now - start
-        # Bins never narrower than the poll interval: finer than that and most
-        # of them are empty by construction, which would read as lost samples.
-        nbx = int(span / minbin); if (nbx > nb) nbx = nb
-        w = span / nbx
-        for (b = 0; b < nbx; b++) { has[b] = 0; v[b] = 0; tv[b] = 0 }
-        lo = P[id, 1]; hi = P[id, 1]
-        for (k = 1; k <= m; k++) {
-          p = P[id, k]
-          if (p < lo) lo = p
-          if (p > hi) hi = p
-          b = int((T[id, k] - start) / w)
-          if (b >= nbx) b = nbx - 1
-          if (!has[b] || p > v[b]) { v[b] = p; tv[b] = T[id, k]; has[b] = 1 }
-        }
-        # Drawn across lo..hi widened to at least 4 points, not 0..100: a weekly
-        # window first seen at 60% and now at 68% would otherwise be 24
-        # identical full blocks, and the widening keeps a 1% wobble from being
-        # drawn as a climb. The label states the observed range, so a series
-        # narrower than 4 points does not reach the top of the chart.
-        top = hi; if (top - lo < 4) top = lo + 4
-        acc = ""
-        for (b = 0; b < nbx; b++) {
-          if (!has[b]) { acc = acc GAP; continue }
-          acc = acc L[int((v[b] - lo) / (top - lo) * 7.999)]
-        }
-        # 30 minutes of lag where the cycle is long enough to afford it, but
-        # never more than a quarter of the chart: a longer lag than that leaves
-        # the left of the rate row with nothing to say for hours.
-        lag = int(1800 / w); if (lag > int(nbx / 4)) lag = int(nbx / 4)
-        if (lag < 1) lag = 1
-        # Both ends of a difference have to be real samples, and the divisor is
-        # the time that actually elapsed between them. Carrying the last known
-        # value across a sleep and dividing by the nominal lag would charge
-        # every percent the gap hid to the one bin after it — a spike that never
-        # happened, which then sets the scale for the whole row.
-        for (b = 0; b < nbx; b++) {
-          d[b] = -1
-          if (b < lag || !has[b] || !has[b - lag]) continue
-          el = tv[b] - tv[b - lag]
-          if (el <= 0) continue
-          d[b] = (v[b] - v[b - lag]) * 3600 / el
-          if (d[b] < 0) d[b] = 0
-        }
-        # A three-bin mean on top of that difference. Without it the bar
-        # alternates between "one whole percent landed in this window" and "two
-        # did", which looks like a burst pattern that is not there.
-        mx = 0
-        for (b = 0; b < nbx; b++) {
-          r[b] = -1
-          if (d[b] < 0) continue
-          sum = 0; cn = 0
-          for (j = b - 1; j <= b + 1; j++)
-            if (j >= 0 && j < nbx && d[j] >= 0) { sum += d[j]; cn++ }
-          r[b] = sum / cn
-          if (r[b] > mx) mx = r[b]
-        }
-        rs = ""
-        for (b = 0; b < nbx; b++) {
-          if (r[b] < 0) { rs = rs GAP; continue }
-          rs = rs L[(mx > 0) ? int(r[b] / mx * 7.999) : 0]
-        }
-        # Headline rate over the trailing hour, so "idle" shows up as idle
-        # rather than as the average since the window opened.
-        #
-        # The anchor has to be an hour old, not merely the newest sample that
-        # is at least an hour old: after a sleep that is the last sample before
-        # the sleep, and averaging over the gap dilutes a fresh burn towards
-        # zero — the one direction a quota indicator must never err in. When
-        # there is no usable anchor an hour back, anchor at the oldest sample
-        # inside the hour instead, and say nothing at all until that gives a
-        # basis worth quoting.
-        ref = 0
-        for (k = 1; k <= m; k++) if (T[id, k] <= now - 3600) ref = k
-        if (ref == 0 || now - T[id, ref] > 5400) {
-          ref = m
-          for (k = m; k >= 1; k--) if (T[id, k] >= now - 3600) ref = k
-        }
-        dt = T[id, m] - T[id, ref]
-        cur = -1; eta = -1
-        if (dt >= 900) {
-          cur = (P[id, m] - P[id, ref]) * 3600 / dt
-          if (cur < 0) cur = 0
-          if (cur > 0 && P[id, m] < 100) eta = (100 - P[id, m]) / cur * 3600
-        }
-        printf fmt, id, sep, span, sep, acc, sep, rs, sep,
-          (cur < 0 ? "-" : sprintf("%.1f", cur)), sep, lo, sep, hi, sep,
-          (eta < 0 ? "-" : sprintf("%d", eta)), sep, sprintf("%.1f", mx)
-      }
-    }' "$HISTORY" 2>/dev/null
-}
-
-# Two rows under a window: what the cycle has looked like, and how fast it is
-# moving. Both are labelled with the range they are drawn across, because both
-# sparklines are scaled to their own series rather than to a fixed 0-100.
-hist_rows() {  # $1 window id, $2 reset epoch (0 if unknown)
-  local id="$1" reset_at="${2:-0}" hid span acc rate cur lo hi eta peak note
-  [[ -n "$hist_out" ]] || return 0
-  while IFS="$SEP" read -r hid span acc rate cur lo hi eta peak; do
-    [[ "$hid" == "$id" ]] || continue
-    if [[ "$span" == "0" ]]; then
-      printf '%sgathering history… | %s\n' "$PAD" "$DIM"
-      return 0
-    fi
-    printf '%s%s  %s→%s%%  over %s | %s\n' "$PAD" "$acc" "$lo" "$hi" \
-      "$(human_delta "$span")" "$ROW"
-    if [[ "$cur" == "-" ]]; then
-      note="rate unknown"
-    elif [[ "$cur" == "0.0" ]]; then
-      note="idle"
-    elif [[ "$eta" == "-" ]]; then
-      note="now $cur"
-    elif (( reset_at > 0 && NOW + eta > reset_at )); then
-      # The honest headline once the window will reset before the quota runs
-      # out: the countdown above is what matters, not a projection past it.
-      note="now $cur · resets first"
-    else
-      note="now $cur · 100% in $(human_delta "$eta")"
-    fi
-    printf '%s%s  0→%s %%/h  %s | %s\n' "$PAD" "$rate" "$peak" "$note" "$ROW"
-    return 0
-  done <<< "$hist_out"
 }
 
 # ---- fetch ------------------------------------------------------------------
@@ -540,14 +671,13 @@ fi
 # is no cycle to chart it against, so a row for it would be dead weight in the
 # file forever. Tabs are spelled out because they are the history file's field
 # separator and an invisible one in a string literal is a trap.
-samples=""; hist_spec=""
+samples=""
 while IFS="$SEP" read -r kind group pct reset model; do
   [[ -z "$kind" ]] && continue
   [[ "$pct" =~ ^[0-9]+$ ]] || continue
   cycle=$(cycle_key "$reset") || continue
   id=$(win_id "$kind" "$model")
   samples+="$NOW"$'\t'"$id"$'\t'"$pct"$'\t'"$cycle"$'\n'
-  hist_spec+="${hist_spec:+;}$id|$cycle"
 done <<< "$rows"
 
 # Only on a fetch. SwiftBar re-renders on wake, on click and on every backed-off
@@ -569,8 +699,9 @@ if (( did_fetch )) && [[ -n "$samples" ]]; then
   fi
 fi
 
-hist_out=""
-[[ -n "$hist_spec" ]] && hist_out=$(history_series "$hist_spec")
+# The popover is rebuilt every render, because the click has to find it
+# already there. Its return value is the set of pools it could chart.
+write_chart_html || true
 
 # Menu bar shows the short window and whichever long window is closest to
 # biting — that is the number that will actually stop you, whether the plan
@@ -602,13 +733,9 @@ mb="$session_pct"
 printf '%s%s | %s%s\n' "${mb:-?}" "$stale" "$FONT" "$color"
 
 printf -- '---\n'
-first=1
 while IFS="$SEP" read -r kind group pct reset model; do
   [[ -z "$kind" ]] && continue
-  (( first )) || printf -- '---\n'
-  first=0
-  window_row "$(label_for "$kind" "$model")" "$pct" "$reset"
-  hist_rows "$(win_id "$kind" "$model")" "$(iso_to_epoch "$reset" || printf 0)"
+  pool_row "$(label_for "$kind" "$model")" "$pct" "$reset" "$(win_id "$kind" "$model")"
 done <<< "$rows"
 
 extra=$(jq -r '
@@ -616,8 +743,7 @@ extra=$(jq -r '
   then ((.extra_usage.utilization // 0) | floor | tostring)
   else empty end' "$CACHE" 2>/dev/null)
 if [[ -n "$extra" ]]; then
-  printf -- '---\n'
-  meter_row "Extra usage" "$extra"
+  pool_row "Extra usage" "$extra" none ""
 fi
 
 printf -- '---\n'
@@ -637,4 +763,8 @@ printf 'Reveal cached response | bash=/usr/bin/open param1=-R param2="%s" termin
 # a false test would otherwise make the plugin exit non-zero on a first run.
 if [[ -s "$HISTORY" ]]; then
   printf 'Reveal usage history | bash=/usr/bin/open param1=-R param2="%s" terminal=false\n' "$HISTORY"
+fi
+if [[ -s "$CHART_HTML" ]]; then
+  printf 'Usage history charts | href=file://%s webview=true webvieww=%s webviewh=%s %s\n' \
+    "$CHART_HTML" "$POPOVER_W" "$POPOVER_H" "$POOL_ROW"
 fi
