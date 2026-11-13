@@ -178,16 +178,37 @@ Today is *derived*, not reported: the API has no daily window, so it accumulates
 the positive steps of the longest window since local midnight, counting a reset
 only when the figure actually falls. Anything that costs samples — sleep,
 backoff, an expired token — makes it a floor rather than a total, and it says
-so. Its axes are the two exceptions to the fixed-axis rule above: the cumulative
+so. Its axes are exceptions to the fixed-axis rule above, though still not fitted: the cumulative
 chart is scaled to an even day's share of the window (`100% / 30` for a monthly
 one) rather than to 0–100%, since a day is never a large fraction of a month,
 and that share is drawn as the reference line.
 
+### Spend
+
+The spend pool (**Monthly spend**, or **Extra usage** on a plan with windows)
+is recorded in money, not percent: a month's real use is a sliver of a large
+cap, and its percentage would read 0% for weeks. Its section shows two charts
+over the current calendar month:
+
+- **Cumulative spend**, with the projected month-end total in the heading. This
+  is the one axis in the popover fitted to the data. A 0–cap axis would flatten everything
+  onto the floor, so the cap line only appears once spend gets close to it.
+- **Spend per day**, as bars, which is the intensity view. A day with no samples
+  (the Mac was asleep or off all day) has no bar and reads "not observed".
+
+The total is an account-wide counter, so a gap in the samples loses nothing:
+the next sample carries it. Spend during a gap is charged to the day the gap
+ended, though. The API gives no reset date for this pool, so history is grouped
+by calendar month. If your billing month starts on another day, the reset shows
+up as a drop partway through.
+
 `history.tsv` is tab-separated `epoch`, `window`, `percent`, `cycle` — plottable
-with anything — pruned to 30 days (about 1.7 MB) and openable from **Reveal
+with anything — pruned to 32 days (about 1.8 MB) and openable from **Reveal
 usage history** in the dropdown. It holds a timestamp, the window name including
 the model scope where the API reports one, the utilization percentage and which
-reset it belongs to. No prompts, no content, no credentials.
+reset it belongs to. Spend rows use the window name `spend`, hold hundredths
+of the currency in the percent column, and belong to the next month's first
+midnight. No prompts, no content, no credentials.
 
 ## Failures
 

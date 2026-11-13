@@ -34,8 +34,9 @@ STATE="$STATE_DIR/state"
 HISTORY="$STATE_DIR/history.tsv"
 CHART_HTML="$STATE_DIR/chart.html"
 
-# One row per window per successful fetch; 30 days at a 180s poll is ~1.7 MB.
-HIST_KEEP=$(( 30 * 86400 ))
+# One row per window per successful fetch; 32 days at a 180s poll is ~1.8 MB.
+# A day over the longest month, so a monthly chart never loses its first day.
+HIST_KEEP=$(( 32 * 86400 ))
 HIST_PRUNE_EVERY=86400
 
 # Charts need the window's start, and the API only reports when it ends. These
@@ -280,7 +281,7 @@ pool_row() {  # $1 label, $2 pct, $3 resets_at ("none" = not a window), $4 ancho
   fi
   # Every window row is clickable, including one with nothing to plot: the
   # popover gives it a section saying why, which beats a row that looks broken.
-  # Extra usage has no history series, so it gets no anchor and no link.
+  # The spend pool links to its own section, anchored "spend".
   if [[ -n "${4:-}" && -s "$CHART_HTML" ]]; then
     action="href=file://$CHART_HTML#$4 webview=true webvieww=$POPOVER_W webviewh=$POPOVER_H $POOL_ROW"
   else
@@ -384,7 +385,8 @@ today_json() {  # $1 id, $2 midnight epoch
 # question that actually matters is "how close am I to the limit, and how far
 # through the window". So utilisation runs 0-100% and time runs the full window,
 # start to reset. A low cycle therefore draws a flat line near the floor — that
-# is the honest picture, not a defect.
+# is the honest picture, not a defect. Spend is the one exception, explained
+# at its section in the page below.
 #
 # Every pool row in the menu links here, so every pool needs a section. Returns
 # non-zero when there was nothing to chart at all, which is not an error.
@@ -417,9 +419,20 @@ write_chart_html() {
     pools+="${pools:+,}{\"id\":\"$id\",\"label\":\"$label\",\"reset\":$epoch,\"len\":$len,\"p\":[$pts]}"
     if (( len > plen )); then primary="$id"; plen=$len; fi
   done <<< "$rows"
-  # No windows at all (a spend-only plan): a popover left over from a previous
-  # plan would keep charting limits this account no longer has.
-  [[ -n "$pools" ]] || { rm -f "$CHART_HTML"; return 1; }
+  # The spend pool gets a section whenever it exists, for the same reason every
+  # window does: its row links here.
+  local spend_js="null" spts cap="null"
+  if [[ -n "$spend" ]] && (( MONTH1 > 0 )); then
+    [[ "$spend_cap" =~ ^[0-9]+(\.[0-9]+)?$ ]] && cap=$spend_cap
+    if spts=$(samples_json spend "$MONTH1"); then
+      spend_js="{\"label\":\"$spend_label\",\"title\":\"$spend_title\",\"cap\":$cap,\"cur\":\"${spend_cur//[^A-Z]/}\",\"x0\":$MONTH0,\"x1\":$MONTH1,\"p\":[$spts]}"
+    else
+      spend_js="{\"label\":\"$spend_label\",\"note\":\"Gathering history. A chart needs a few samples, one per fetch.\"}"
+    fi
+  fi
+  # Nothing to chart at all: a popover left over from a previous plan would keep
+  # charting limits this account no longer has.
+  [[ -n "$pools" || "$spend_js" != null ]] || { rm -f "$CHART_HTML"; return 1; }
 
   # Today is only built when nothing shorter than a day is already charted: a
   # A day is a meaningful slice of a month and not of a week, and the scan is not
@@ -456,6 +469,7 @@ text{fill:var(--dim);font-size:9px;font-family:-apple-system,sans-serif}
 HEAD
     # "null", never the empty string: an unset TODAY would emit `const TODAY=;`
     # and a single syntax error takes the whole page down, charts included.
+    printf 'const SPEND=%s;\n' "$spend_js"
     printf 'const POOLS=[%s];\nconst TODAY=%s;\nconst NOW=%d;\nconst DAY0=%d;\nconst DAY1=%d;\nconst PRIMARY=%s;\nconst TODAY_MIN=%d;\n' \
       "$pools" "$today_js" "$NOW" "$midnight" "$tomorrow" "\"${primary:-}\"" "$TODAY_MIN_WINDOW"
     cat <<'TAIL'
@@ -480,7 +494,8 @@ function chart(parent, o) {
     run = [];
   };
   let prev = null;
-  for (const q of o.series) { if (prev !== null && q[0] - prev > GAP) flush(); run.push(q); prev = q[0]; }
+  const gap = o.gap || GAP;
+  for (const q of o.series) { if (prev !== null && q[0] - prev > gap) flush(); run.push(q); prev = q[0]; }
   flush();
 
   const bits = [];
@@ -591,6 +606,100 @@ if (TODAY && TODAY.length > 1 && longest >= TODAY_MIN) {
     yticks: [0], fmt: () => '%/h', xfmt: clock,
     read: v => v.toFixed(2) + ' %/h',
   });
+}
+
+// Spend, in money rather than percent. Unlike utilisation this one axis is
+// fitted: a monthly cap usually sits far above a month's real use, and a 0-cap
+// axis would press the whole line into the floor. The cap is drawn once the
+// line gets near it, and stated in words until then.
+//
+// The total is an account-wide counter, so a gap in the samples loses no money:
+// the next sample carries it. That is why the line is joined across gaps, and
+// why a day's bar is complete except that spend during a gap lands on the day
+// the gap ended.
+const money = (v, cur, d = 2) => (!cur || cur === 'USD') ? '$' + v.toFixed(d) : v.toFixed(d) + ' ' + cur;
+const dayfmt = t => new Date(t*1000).toLocaleDateString([], {month:'short', day:'numeric'});
+
+function daily(p, x0, x1) {
+  const days = [];
+  for (let d = new Date(x0*1000); d.getTime()/1000 < x1; ) {
+    const a = d.getTime()/1000;
+    d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);   // DST-safe
+    days.push({a, b: d.getTime()/1000, v: null});
+  }
+  for (let i = 0; i < p.length; i++) {
+    const day = days.find(x => p[i][0] >= x.a && p[i][0] < x.b);
+    if (!day) continue;
+    day.v = day.v || 0;      // observed, even if nothing was spent
+    if (i === 0) continue;   // what came before the first sample is unknown
+    // A big fall is a reset: everything on the counter now was spent since. A
+    // small one is a refund or correction, not spend, and must not be booked
+    // as a whole month's total on one day.
+    const pv = p[i-1][1], v = p[i][1];
+    day.v += v >= pv ? v - pv : (v < pv / 2 ? v : 0);
+  }
+  return days;
+}
+
+function bars(parent, o) {
+  const W = 560, H = o.h || 80, L = 38, R = 8, T = 8, B = 16;
+  const x0 = o.days[0].a, x1 = o.days[o.days.length-1].b;
+  const px = t => L + (t - x0) / (x1 - x0) * (W - L - R);
+  const py = v => T + (1 - v / o.y1) * (H - T - B);
+  const bits = [];
+  for (const g of [0, o.y1]) bits.push(
+    '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+py(g).toFixed(1)+'" y2="'+py(g).toFixed(1)+'" stroke="var(--grid)" stroke-width="1"/>' +
+    '<text x="'+(L-5)+'" y="'+(py(g)+3).toFixed(1)+'" text-anchor="end">'+o.fmt(g)+'</text>');
+  for (const d of o.days) if (d.v != null) bits.push(
+    '<rect x="'+(px(d.a)+0.5).toFixed(1)+'" width="'+Math.max(0.5, px(d.b)-px(d.a)-1).toFixed(1)+
+    '" y="'+py(d.v).toFixed(1)+'" height="'+(py(0)-py(d.v)).toFixed(1)+'" fill="var(--line)"/>');
+  if (NOW >= x0 && NOW <= x1) bits.push(
+    '<line x1="'+px(NOW).toFixed(1)+'" x2="'+px(NOW).toFixed(1)+'" y1="'+T+'" y2="'+(H-B)+
+    '" stroke="var(--dim)" stroke-width="1" stroke-dasharray="1 3"/>');
+  for (const [t, anchor] of [[x0,'start'],[x1 - 1,'end']]) bits.push(
+    '<text x="'+px(t).toFixed(1)+'" y="'+(H-4)+'" text-anchor="'+anchor+'">'+dayfmt(t)+'</text>');
+  const el = document.createElement('div');
+  el.innerHTML = '<svg viewBox="0 0 '+W+' '+H+'">'+bits.join('')+'</svg><div class=rd>&nbsp;</div>';
+  parent.appendChild(el);
+  const svg = el.querySelector('svg'), rd = el.querySelector('.rd');
+  svg.addEventListener('mousemove', e => {
+    const r = svg.getBoundingClientRect(), fx = (e.clientX - r.left) / r.width * W;
+    const d = o.days.find(x => fx >= px(x.a) && fx < px(x.b));
+    rd.textContent = d ? dayfmt(d.a) + ' — ' + (d.v == null ? 'not observed' : o.read(d.v)) : '\u00a0';
+  });
+  svg.addEventListener('mouseleave', () => { rd.innerHTML = '&nbsp;'; });
+}
+
+if (SPEND && SPEND.note) {
+  section('spend', SPEND.label, '').innerHTML += '<div class=note>' + SPEND.note + '</div>';
+} else if (SPEND) {
+  const cur = SPEND.cur, fmt = v => money(v, cur);
+  const p = SPEND.p.map(q => [q[0], q[1] / 100]);
+  const used = p[p.length-1][1], len = SPEND.x1 - SPEND.x0;
+  const through = Math.min(1, Math.max(0, (NOW - SPEND.x0) / len));
+  const days = daily(p, SPEND.x0, SPEND.x1);
+  const seen = days.filter(d => d.v != null);
+  const sec = section('spend', SPEND.title,
+    fmt(used) + (SPEND.cap != null ? ' of ' + money(SPEND.cap, cur, 0) : '') +
+    ' · ' + (through * 100).toFixed(0) + '% through the month' +
+    (through > 0.05 ? ' · on pace for ' + money(used / through, cur, 0) : ''));
+  const y1 = Math.max(used * 1.25, 1);
+  chart(sec, {
+    x0: SPEND.x0, x1: SPEND.x1, y1, series: p, fill: true, gap: Infinity,
+    ref: SPEND.cap, refLabel: 'cap',
+    yticks: [0, y1], fmt: v => money(v, cur, 0),
+    xfmt: t => dayfmt(Math.min(t, SPEND.x1 - 1)),   // the last day, as the bars label it
+    read: fmt,
+  });
+  const peak = seen.reduce((m, d) => Math.max(m, d.v), 0);
+  const tracked = seen.reduce((m, d) => m + d.v, 0);
+  const sub = document.createElement('div');
+  sub.className = 'sub';
+  sub.textContent = 'Per day · ' + money(tracked, cur) + ' over ' + seen.length +
+    ' observed day' + (seen.length === 1 ? '' : 's') + ', ' +
+    money(seen.length ? tracked / seen.length : 0, cur) + ' a day on average';
+  sec.appendChild(sub);
+  bars(sec, { days, y1: Math.max(peak * 1.15, 1), fmt: v => money(v, cur, 0), read: fmt });
 }
 </script>
 TAIL
@@ -762,6 +871,24 @@ if [[ -z "$rows" && -z "$spend" ]]; then
 	EOF
 fi
 
+# With no rate-limit windows the spend cap is the only thing that can stop you,
+# so it takes over the menu bar and the warning colour. Alongside windows it is
+# overflow and stays in the dropdown.
+spend_only=0
+[[ -z "$rows" && -n "$spend" ]] && spend_only=1
+spend_label="Extra usage"; spend_title="Extra usage this month"
+(( spend_only )) && { spend_label="Monthly spend"; spend_title="Spend this month"; }
+
+# The API gives the spend pool no reset time, so its history is filed by local
+# calendar month: the cycle is next month's first midnight, the same "which
+# reset does this belong to" meaning a window's cycle has. A billing month that
+# does not line up with the calendar would show as a drop part-way through.
+# From NOW, not a fresh clock read, so a run straddling midnight on the last day
+# cannot stamp a sample with one month and file it under the next.
+month_day1=$(date -r "$NOW" '+%Y-%m-01')
+MONTH0=$(date -j -f '%Y-%m-%d %H:%M:%S' "$month_day1 00:00:00" +%s 2>/dev/null) || MONTH0=0
+MONTH1=$(date -j -v+1m -f '%Y-%m-%d %H:%M:%S' "$month_day1 00:00:00" +%s 2>/dev/null) || MONTH1=0
+
 # One pass over the windows for both the write and the read: history is only
 # useful if the key it is written under is the key it is looked up by, and two
 # passes computing that key independently are how they drift apart.
@@ -778,6 +905,12 @@ while IFS="$SEP" read -r kind group pct reset model; do
   id=$(win_id "$kind" "$model")
   samples+="$NOW"$'\t'"$id"$'\t'"$pct"$'\t'"$cycle"$'\n'
 done <<< "$rows"
+# Spend goes in as hundredths of the currency, not a percentage: a month's real
+# use is a sliver of a large cap and its percentage stays 0 for weeks.
+if [[ -n "$spend" ]] && (( MONTH1 > 0 )); then
+  cents=$(LC_ALL=C awk -v a="$spend_used" 'BEGIN { printf "%d", a * 100 + 0.5 }')
+  samples+="$NOW"$'\t'"spend"$'\t'"$cents"$'\t'"$MONTH1"$'\n'
+fi
 
 # Only on a fetch. SwiftBar re-renders on wake, on click and on every backed-off
 # tick; stamping the cached numbers again with a fresh timestamp would flatten
@@ -824,11 +957,6 @@ while IFS="$SEP" read -r kind group pct reset model; do
   fi
 done <<< "$rows"
 
-# With no rate-limit windows the spend cap is the only thing that can stop you,
-# so it takes over the menu bar and the warning colour. Alongside windows it is
-# overflow and stays in the dropdown.
-spend_only=0
-[[ -z "$rows" && -n "$spend" ]] && spend_only=1
 if (( spend_only )) && [[ "$spend_pct" =~ ^[0-9]+$ ]] && (( spend_pct > worst )); then
   worst=$spend_pct
 fi
@@ -882,8 +1010,7 @@ if [[ -n "$spend" ]]; then
   else
     spend_tail="$(money "$spend_used" "$spend_cur") spent, no cap"
   fi
-  (( spend_only )) && spend_label="Monthly spend" || spend_label="Extra usage"
-  pool_row "$spend_label" "$spend_pct" none "" "$spend_tail"
+  pool_row "$spend_label" "$spend_pct" none spend "$spend_tail"
 fi
 
 printf -- '---\n'
