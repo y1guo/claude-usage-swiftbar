@@ -255,9 +255,10 @@ label_for() {
 # line, so labels that came from the API are stripped of it before rendering.
 # A percentage that did not survive parsing is shown as unknown, never as 0%.
 #
-# One line per pool: label, percentage, bar, and when it resets. Clicking it
+# One line per pool: label, percentage, bar, and when it resets (or, for the
+# spend pool, how much money). Clicking it
 # opens the chart popover at that pool's section.
-pool_row() {  # $1 label, $2 pct, $3 resets_at ("none" = not a window), $4 anchor
+pool_row() {  # $1 label, $2 pct, $3 resets_at ("none" = not a window), $4 anchor, $5 tail for a "none" pool
   local label="${1//[|$'\n']/ }" pct="${2:-}" bar tail epoch action
   if [[ "$pct" =~ ^[0-9]+$ ]]; then
     bar=$(printf '%3d%% %s' "$pct" "$(meter "$pct")")
@@ -265,9 +266,12 @@ pool_row() {  # $1 label, $2 pct, $3 resets_at ("none" = not a window), $4 ancho
     bar='  ?% unreadable'
   fi
   if [[ "${3:-}" == "none" ]]; then
-    # Extra usage is a spending pool, not a rate-limit window; it has no reset
-    # and saying "no active window" about it would be a plain falsehood.
-    tail=""
+    # The spend pool is not a rate-limit window; it has no reset
+    # and saying "no active window" about it would be a plain falsehood. Its
+    # tail is the money, which says more than a percentage of a large cap.
+    tail="${5:-}"
+    # An uncapped pool has no percentage to be unreadable.
+    [[ "$pct" =~ ^[0-9]+$ ]] || bar='   –'
   elif epoch=$(iso_to_epoch "${3:-}"); then
     tail=$(printf 'resets in %-8s (%s)' "$(human_delta "$(( epoch - NOW ))")" \
       "$(date -r "$epoch" '+%a %H:%M')")
@@ -413,7 +417,9 @@ write_chart_html() {
     pools+="${pools:+,}{\"id\":\"$id\",\"label\":\"$label\",\"reset\":$epoch,\"len\":$len,\"p\":[$pts]}"
     if (( len > plen )); then primary="$id"; plen=$len; fi
   done <<< "$rows"
-  [[ -n "$pools" ]] || return 1
+  # No windows at all (a spend-only plan): a popover left over from a previous
+  # plan would keep charting limits this account no longer has.
+  [[ -n "$pools" ]] || { rm -f "$CHART_HTML"; return 1; }
 
   # Today is only built when nothing shorter than a day is already charted: a
   # A day is a meaningful slice of a month and not of a week, and the scan is not
@@ -715,13 +721,41 @@ rows=$(jq -r --arg sep "$SEP" '
         (.resets_at // ""),
         (((.scope // {}) | objects | .model.display_name) // "") ]
   else
-    ( {k: "session",    g: "session", p: (.five_hour.utilization? // null), r: (.five_hour.resets_at? // "")},
-      {k: "weekly_all", g: "weekly",  p: (.seven_day.utilization? // null), r: (.seven_day.resets_at? // "")} )
-    | [ .k, .g, (.p | pct), (.r // ""), "" ]
+    # A null bucket is a window the plan does not have, not one that failed to
+    # parse: a usage-based enterprise seat nulls both and has only a spend cap.
+    ( {k: "session",    g: "session", w: .five_hour},
+      {k: "weekly_all", g: "weekly",  w: .seven_day} )
+    | select(.w | type == "object")
+    | [ .k, .g, (.w.utilization | pct), (.w.resets_at // ""), "" ]
   end | map(tostring) | join($sep)' "$CACHE" 2>/dev/null)
 jq_rc=$?
 
-if [[ -z "$rows" ]]; then
+# The spend pool: extra usage on a subscription, and the only limit there is on
+# a usage-based enterprise seat. spend{} is the current shape and carries money
+# in minor units; extra_usage{} is the older one. Fields: used, cap ("" when
+# uncapped), currency, percent (-1 when there is no cap to be a percent of).
+spend=$(jq -r --arg sep "$SEP" '
+  def amt: if type == "object" and (.amount_minor | type) == "number"
+           then .amount_minor / pow(10; .exponent // 2) else null end;
+  def pct($u; $c): if ($c | type) == "number" and $c > 0 then ($u * 100 / $c | floor) else -1 end;
+  if (.spend | type) == "object" and (.spend.enabled // false) and (.spend.used | amt) != null then
+    (.spend.used | amt) as $u | (.spend.limit | amt) as $c
+    | [ $u, ($c // ""), (.spend.used.currency // ""), pct($u; $c) ]
+  elif (.extra_usage | type) == "object" and (.extra_usage.is_enabled // false) then
+    .extra_usage as $x | pow(10; $x.decimal_places // 2) as $d
+    | (($x.used_credits // 0) / $d) as $u
+    | (if ($x.monthly_limit | type) == "number" then $x.monthly_limit / $d else null end) as $c
+    | [ $u, ($c // ""), ($x.currency // ""), pct($u; $c) ]
+  else empty end | map(tostring) | join($sep)' "$CACHE" 2>/dev/null)
+IFS="$SEP" read -r spend_used spend_cap spend_cur spend_pct <<< "$spend"
+
+money() {  # $1 amount in major units, $2 ISO currency code
+  local a
+  a=$(LC_ALL=C awk -v a="$1" 'BEGIN { s = sprintf("%.2f", a); sub(/\.00$/, "", s); print s }')
+  if [[ -z "${2:-}" || "$2" == "USD" ]]; then printf '$%s' "$a"; else printf '%s %s' "$a" "$2"; fi
+}
+
+if [[ -z "$rows" && -z "$spend" ]]; then
   die "⚠️ usage" <<-EOF
 	Response contained no recognisable limits. | $DIM
 	Inspect $CACHE | $DIM
@@ -790,6 +824,15 @@ while IFS="$SEP" read -r kind group pct reset model; do
   fi
 done <<< "$rows"
 
+# With no rate-limit windows the spend cap is the only thing that can stop you,
+# so it takes over the menu bar and the warning colour. Alongside windows it is
+# overflow and stays in the dropdown.
+spend_only=0
+[[ -z "$rows" && -n "$spend" ]] && spend_only=1
+if (( spend_only )) && [[ "$spend_pct" =~ ^[0-9]+$ ]] && (( spend_pct > worst )); then
+  worst=$spend_pct
+fi
+
 age=$(( NOW - fetched_at ))
 stale=""
 { (( fetched_at > 0 && age > 600 )) || [[ -n "$last_error" ]] || (( jq_rc != 0 )); } && stale="⋯"
@@ -821,6 +864,10 @@ else
   [[ -n "$session_pct" && -n "$long_pct" ]] && mb="${session_pct}·${long_pct}"
   [[ -z "$session_pct" ]] && mb="$long_pct"
 fi
+if (( spend_only )); then
+  mb=$(money "$spend_used" "$spend_cur")
+  [[ "$MENUBAR" == "detailed" && -n "$spend_cap" ]] && mb+=" / $(money "$spend_cap" "$spend_cur")"
+fi
 printf '%s%s | %s%s\n' "${mb:-?}" "$stale" "$FONT" "$color"
 
 printf -- '---\n'
@@ -829,12 +876,14 @@ while IFS="$SEP" read -r kind group pct reset model; do
   pool_row "$(label_for "$kind" "$model")" "$pct" "$reset" "$(win_id "$kind" "$model")"
 done <<< "$rows"
 
-extra=$(jq -r '
-  if (.extra_usage.is_enabled // false)
-  then ((.extra_usage.utilization // 0) | floor | tostring)
-  else empty end' "$CACHE" 2>/dev/null)
-if [[ -n "$extra" ]]; then
-  pool_row "Extra usage" "$extra" none ""
+if [[ -n "$spend" ]]; then
+  if [[ -n "$spend_cap" ]]; then
+    spend_tail="$(money "$spend_used" "$spend_cur") of $(money "$spend_cap" "$spend_cur")"
+  else
+    spend_tail="$(money "$spend_used" "$spend_cur") spent, no cap"
+  fi
+  (( spend_only )) && spend_label="Monthly spend" || spend_label="Extra usage"
+  pool_row "$spend_label" "$spend_pct" none "" "$spend_tail"
 fi
 
 printf -- '---\n'

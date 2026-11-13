@@ -46,10 +46,14 @@ renders all of them rather than looking for specific ones:
 | --- | --- |
 | Pro / Max | session (5h), weekly (all), weekly per-model |
 | Enterprise | session, monthly |
+| Enterprise (usage-based seat) | none — only a monthly spend cap |
 
 The menu bar always shows `session·<highest other>`, so on a monthly plan the
 second number is the monthly figure. An account with no session window shows a
-single number. A window kind this plugin has never seen still appears in the
+single number. An account with no windows at all shows its spend instead —
+`$20.08` compact, `$20.08 / $3000` detailed — and the dropdown lists it as
+**Monthly spend**; the menu bar colour tracks how close it is to the cap. On plans that do have
+windows the same pool appears as **Extra usage**, in dollars. A window kind this plugin has never seen still appears in the
 dropdown with a readable label derived from its name, so a future plan shape
 degrades to "slightly awkward label" rather than "silently missing limit".
 
@@ -212,8 +216,8 @@ your Claude Code login.
   monthly window and the Today charts it unlocks, which are exercised against a
   synthetic response rather than a live plan. If the numbers don't match your
   Claude Code settings → usage page, the raw JSON will say why.
-- Only utilization percentages are available. `limit_dollars` and `used_dollars`
-  come back `null` on subscription plans, so there is no absolute "X of Y".
+- Rate-limit windows only report utilization percentages, so there is no
+  absolute "X of Y" for them. The spend pool is the exception: it reports money.
 - The poll interval is encoded in the filename (`.180s.`). 180s is what the
   endpoint tolerates; faster invites 429s. It is also the best resolution the
   history can have, and the real resolution is coarser: sleep and backoff both
